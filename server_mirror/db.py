@@ -1,10 +1,11 @@
 """SQLite 热度榜与探测历史（标准库 sqlite3，写串行 + WAL）。
 
-三张表各司其职：
+各表职责：
 
 - ``servers``：榜单成员（内置种子 / 用户上报 / 接口导入），带热度累加字段；
 - ``servers_state``：每个成员最近一次探测的完整快照（含 MOTD / 玩家列表 / 图标）；
-- ``ping_history``：探测时间线，供延迟曲线与「近 24h 平均在线」热度分量使用。
+- ``ping_history``：探测时间线，供延迟曲线与「近 24h 平均在线」热度分量使用；
+- ``server_complaints``：用户手动举报的服务器，供管理端审核（状态 0/1/2）。
 
 单写多读：整库共用一条连接 + 一把可重入锁串行写，开 WAL 让读不阻塞写。
 """
@@ -20,7 +21,7 @@ from typing import Any, Iterable
 
 __all__ = ["Database", "SCHEMA_VERSION"]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: 热度里「近 24h 平均在线」的统计窗口（秒）
 _ONLINE_WINDOW = 24 * 3600
@@ -78,6 +79,21 @@ CREATE TABLE IF NOT EXISTS p2p_rooms (
     last_open  REAL    NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_p2p_rooms_owner ON p2p_rooms (owner);
+CREATE TABLE IF NOT EXISTS server_complaints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    host        TEXT    NOT NULL,
+    port        INTEGER NOT NULL,
+    reason      TEXT    NOT NULL DEFAULT '',
+    detail      TEXT    NOT NULL DEFAULT '',
+    contact     TEXT    NOT NULL DEFAULT '',
+    client      TEXT    NOT NULL DEFAULT '',
+    status      INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL    NOT NULL DEFAULT 0,
+    handled_at  REAL    NOT NULL DEFAULT 0,
+    handled_by  TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_complaints_target ON server_complaints (host, port);
+CREATE INDEX IF NOT EXISTS ix_complaints_status ON server_complaints (status, created_at);
 """
 
 
@@ -191,6 +207,72 @@ class Database:
                 (1 if enabled else 0, host, int(port)),
             )
             self._conn.commit()
+
+    # ---------------------------------------------------------------- 举报
+    def add_complaint(
+        self, host: str, port: int, reason: str, detail: str = "", contact: str = "", client: str = ""
+    ) -> int:
+        """登记一条用户举报，返回新记录 id（``created_at`` 取当前时间）。"""
+        host = str(host or "").strip().lower()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO server_complaints(host, port, reason, detail, contact, client, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    host,
+                    int(port),
+                    str(reason or "").strip()[:24],
+                    str(detail or "").strip()[:500],
+                    str(contact or "").strip()[:120],
+                    str(client or "").strip()[:32],
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_complaints(self, status: int | None = None, limit: int = 200) -> list[dict]:
+        """按状态列出举报（``status=None`` 表示全部），新的在前。"""
+        limit = max(0, int(limit))
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM server_complaints ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM server_complaints WHERE status=? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (int(status), limit),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_complaints(self, status: int | None = None) -> int:
+        """统计举报总数；传入 ``status`` 只统计该状态。"""
+        with self._lock:
+            if status is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) c FROM server_complaints"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) c FROM server_complaints WHERE status=?",
+                    (int(status),),
+                ).fetchone()
+        return int(row["c"])
+
+    def set_complaint_status(self, complaint_id: int, status: int, handled_by: str = "") -> int:
+        """更新举报处理状态并记录处理时间，返回受影响行数。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE server_complaints SET status=?, handled_at=?, handled_by=? WHERE id=?",
+                (int(status), time.time(), str(handled_by or "").strip()[:64], int(complaint_id)),
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
 
     # -------------------------------------------------------- 离线联机房间（持久登记）
     def count_rooms(self, owner: str) -> int:

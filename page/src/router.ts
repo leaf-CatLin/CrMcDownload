@@ -27,6 +27,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: "关于" },
   },
   {
+    path: "/privacy",
+    name: "privacy",
+    component: () => import("@/views/Privacy.vue"),
+    meta: { title: "隐私政策" },
+  },
+  {
     // 运维看板：保留原有页面，挂在 /status 下，和官网共用同一份构建产物
     path: "/status",
     component: DashboardLayout,

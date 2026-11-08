@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
-import { api, SITE_VERSION, humanBytes, type Metrics, type ServersOverview } from "@/api/client";
+import { api, latestVersion, loadLatestVersion, humanBytes, type Metrics, type ServersOverview } from "@/api/client";
 
 const metrics = ref<Metrics>({});
 const servers = ref<ServersOverview>({});
 const cacheBytes = ref<number | undefined>();
 
 onMounted(async () => {
+  void loadLatestVersion();
   try {
     const overview = await api.overview();
     metrics.value = overview.metrics || {};
@@ -93,7 +94,7 @@ const faqs = [
     <section class="hero">
       <div class="wrap">
         <div>
-          <span class="eyebrow">MINECRAFT 启动器 · v{{ SITE_VERSION }} 已上线</span>
+          <span class="eyebrow">MINECRAFT 启动器 · v{{ latestVersion }} 已上线</span>
           <h1>
             把 Minecraft 装进背包，<br />
             <span class="mark">一键出发喵！</span>
@@ -103,7 +104,7 @@ const faqs = [
             统统帮你搬回家。自带镜像加速与断点续传，线路抽风的时候它会自己换条路。
           </p>
           <div class="hero-actions">
-            <RouterLink class="btn primary" to="/download">下载 v{{ SITE_VERSION }}</RouterLink>
+            <RouterLink class="btn primary" to="/download">下载 v{{ latestVersion }}</RouterLink>
             <RouterLink class="btn" to="/changelog">看看更新了什么</RouterLink>
           </div>
           <div class="hero-meta">
@@ -236,11 +237,11 @@ const faqs = [
         <div class="band">
           <div>
             <h2>准备好了吗？就差你点这一下</h2>
-            <p>v{{ SITE_VERSION }} · Windows 安装包 · 装完就能看到熟悉的方块世界。</p>
+            <p>v{{ latestVersion }} · Windows 安装包 · 装完就能看到熟悉的方块世界。</p>
           </div>
           <div class="hero-actions" style="margin: 0">
             <RouterLink class="btn primary" to="/download">去下载页</RouterLink>
-            <a class="btn" href="https://github.com/crazying-dev/CrMcDownload/releases" target="_blank" rel="noreferrer">GitHub Releases</a>
+            <a class="btn" href="https://github.com/leaf-CatLin/CrMcDownload/releases" target="_blank" rel="noreferrer">GitHub Releases</a>
           </div>
         </div>
       </div>

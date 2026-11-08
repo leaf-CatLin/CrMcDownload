@@ -2,7 +2,28 @@
 // 令牌不进前端（读接口免 token），因此这里不附带任何鉴权头。
 // 每个请求都带 X-OffCraft-Version，版本过低时服务端会返回 426。
 
+import { ref } from "vue";
+
 export const SITE_VERSION = __APP_VERSION__;
+
+//: 官网展示的版本号：初始为构建版本，加载 /api/update 后自动跟随线上最新版本
+export const latestVersion = ref<string>(SITE_VERSION);
+let latestVersionTask: Promise<string> | null = null;
+
+/** 拉取一次线上最新版本；失败或接口缺失时保留构建版本。 */
+export function loadLatestVersion(): Promise<string> {
+  if (!latestVersionTask) {
+    latestVersionTask = api
+      .update()
+      .then((payload: UpdatePayload) => {
+        const value = String(payload.latest_version || "").trim().replace(/^v/i, "");
+        if (value) latestVersion.value = value;
+        return latestVersion.value;
+      })
+      .catch(() => latestVersion.value);
+  }
+  return latestVersionTask;
+}
 
 export interface UpdatePayload {
   ok?: boolean;

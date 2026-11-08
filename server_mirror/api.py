@@ -2,8 +2,13 @@
 
 约定（与 ``proxy.py`` 协商）：本路由只在 ``_dispatch`` 里按前缀被调用，返回
 ``(status, headers_dict, body_bytes)``，由 handler 统一写回。读接口免令牌，
-写接口（``POST /api/servers/report``、``POST /skin/*``）在没有配置令牌时放行、
-配置了就必须带 ``X-OffCraft-Token``。响应统一 UTF-8 JSON，读接口带 15s 短缓存。
+写接口（``POST /api/servers/report``、``POST /api/servers/complaints``、
+``POST /skin/*``）在没有配置令牌时放行、配置了就必须带 ``X-OffCraft-Token``。
+响应统一 UTF-8 JSON，读接口带 15s 短缓存。
+
+``POST /api/servers/complaints`` 是用户手动举报服务器的唯一入口：客户端不会
+自动上报用户添加的服务器，只有用户点「举报服务器」时才提交；服务端只做入库
+（``server_complaints``），供管理端审核，不改变榜单状态。
 """
 
 from __future__ import annotations
@@ -150,6 +155,10 @@ class ApiRouter:
 
     # --------------------------------------------------------------- /api
     def _serve_api(self, method: str, path: str, params: dict[str, str], headers: dict[str, str], body):
+        if path == "/api/servers/complaints":
+            if method == "POST":
+                return self._complaint(body, headers)
+            return _err(405, "方法不允许")
         if method not in ("GET", "HEAD"):
             if path == "/api/servers/report" and method == "POST":
                 return self._report(body, headers)
@@ -227,6 +236,31 @@ class ApiRouter:
             return _err(429, "上报过于频繁，请稍后再试")
         self.db.report(host, port, label=label)
         return _json(200, {"ok": True})
+
+    def _complaint(self, body, headers: dict[str, str]):
+        """``POST /api/servers/complaints``：用户手动举报服务器，只入库待审核。"""
+        if not self._authorized(headers):
+            return _err(403, "需要访问令牌")
+        payload = _decode_json(body)
+        if payload is None:
+            return _err(400, "请求体不是合法 JSON")
+        host = str(payload.get("host") or "")
+        try:
+            host, port = parse_host_port(f"{host}:{payload.get('port') or 25565}")
+        except ServerAddressError as exc:
+            return _err(400, str(exc))
+        reason = str(payload.get("reason") or "").strip()[:24]
+        if not reason:
+            return _err(400, "举报原因不能为空，请填写原因")
+        detail = str(payload.get("detail") or "").strip()[:500]
+        contact = str(payload.get("contact") or "").strip()[:120]
+        client = str(payload.get("client") or "").strip()[:32]
+        if not self._allow_report(host):
+            return _err(429, "举报过于频繁，请稍后再试")
+        complaint_id = self.db.add_complaint(
+            host, port, reason, detail=detail, contact=contact, client=client
+        )
+        return _json(200, {"ok": True, "id": complaint_id})
 
     def _allow_report(self, host: str) -> bool:
         """按主机限流：令牌桶，每秒补 1、容量 10。"""

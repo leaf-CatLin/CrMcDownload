@@ -2,11 +2,11 @@
 import { ref } from "vue";
 import { RouterLink } from "vue-router";
 import { MorphIcon } from "morphicons/vue";
-import { SITE_VERSION } from "@/api/client";
+import { latestVersion } from "@/api/client";
 
 const MENU = "M4 7h16M4 12h16M4 17h16";
 const CLOSE = "M6 6l12 12M18 6L6 18";
-const GITHUB = "https://github.com/crazying-dev/CrMcDownload";
+const GITHUB = "https://github.com/leaf-CatLin/CrMcDownload";
 
 const links = [
   { to: "/", label: "首页" },
@@ -47,7 +47,7 @@ const open = ref(false);
           </svg>
         </a>
         <RouterLink class="btn primary small" to="/download">
-          下载 v{{ SITE_VERSION }}
+          下载 v{{ latestVersion }}
         </RouterLink>
         <button class="menu-toggle" type="button" aria-label="切换导航" @click="open = !open">
           <MorphIcon :icon="open ? CLOSE : MENU" :size="18" :stroke-width="2" />

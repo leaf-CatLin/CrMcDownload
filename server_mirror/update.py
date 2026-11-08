@@ -27,9 +27,9 @@ __all__ = [
     "version_key",
 ]
 
-DEFAULT_REPO = "crazying-dev/CrMcDownload"
+DEFAULT_REPO = "leaf-CatLin/CrMcDownload"
 #: 当前发布版本（与客户端 __version__、page/package.json 保持一致）
-DEFAULT_LATEST = "0.7.0"
+DEFAULT_LATEST = "0.8.5"
 
 _VERSION = re.compile(r"^[0-9]+(\.[0-9]+){0,3}$")
 _PRERELEASE_RANK = {"alpha": 0, "a": 0, "beta": 1, "b": 1, "rc": 2, "pre": 2}

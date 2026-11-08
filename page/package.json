@@ -1,7 +1,7 @@
 {
   "name": "offcraft-page",
   "private": true,
-  "version": "0.7.0",
+  "version": "0.8.5",
   "type": "module",
   "description": "CrMcDownload 官网与镜像服务看板（Vue 3 + vue-router，产物由服务端 /page 提供）",
   "scripts": {

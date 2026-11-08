@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, SITE_VERSION, type UpdatePayload } from "@/api/client";
+import { api, latestVersion, type UpdatePayload } from "@/api/client";
 
 const info = ref<UpdatePayload | null>(null);
 const online = ref(true);
@@ -13,9 +13,9 @@ onMounted(async () => {
   }
 });
 
-const latest = computed(() => info.value?.latest_version || SITE_VERSION);
+const latest = computed(() => info.value?.latest_version || latestVersion.value);
 const min = computed(() => info.value?.min_version || "未设置");
-const repo = "https://github.com/crazying-dev/CrMcDownload";
+const repo = "https://github.com/leaf-CatLin/CrMcDownload";
 const releaseUrl = computed(() => info.value?.release_url || `${repo}/releases/tag/v${latest.value}`);
 const directUrl = computed(
   () =>
@@ -25,7 +25,7 @@ const directUrl = computed(
 const mirrorUrl = computed(
   () =>
     info.value?.mirror_download_url ||
-    `/github/crazying-dev/CrMcDownload/releases/download/v${latest.value}/CrMCDownload-${latest.value}-win64-setup.exe`,
+    `/github/leaf-CatLin/CrMcDownload/releases/download/v${latest.value}/CrMCDownload-${latest.value}-win64-setup.exe`,
 );
 </script>
 
@@ -116,7 +116,7 @@ const mirrorUrl = computed(
       <div class="wrap">
         <div class="band">
           <div>
-            <h2>装好了？去看看 0.7.0 改了什么</h2>
+            <h2>装好了？去看看 v{{ latest }} 改了什么</h2>
             <p>官网、更新路由、自动选源、强制更新……都写进更新日志了。</p>
           </div>
           <RouterLink class="btn" to="/changelog">查看更新日志</RouterLink>

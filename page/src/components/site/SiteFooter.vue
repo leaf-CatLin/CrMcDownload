@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { RouterLink } from "vue-router";
-import { SITE_VERSION } from "@/api/client";
+import { latestVersion } from "@/api/client";
 
-const github = "https://github.com/crazying-dev/CrMcDownload";
-const releases = "https://github.com/crazying-dev/CrMcDownload/releases";
+const github = "https://github.com/leaf-CatLin/CrMcDownload";
+const releases = "https://github.com/leaf-CatLin/CrMcDownload/releases";
 const morphicons = "https://github.com/guillermolg00/morphicons";
 </script>
 
@@ -14,7 +14,7 @@ const morphicons = "https://github.com/guillermolg00/morphicons";
         <div>
           <h4>CrMcDownload</h4>
           <p>一只不太挑食的 Minecraft 启动器，自带镜像、断点续传和一点点猫猫能量。</p>
-          <p>当前版本 v{{ SITE_VERSION }} · MIT License</p>
+          <p>当前版本 v{{ latestVersion }} · MIT License</p>
         </div>
         <div>
           <h4>开始使用</h4>
@@ -35,9 +35,24 @@ const morphicons = "https://github.com/guillermolg00/morphicons";
         </div>
       </div>
       <div class="footer-bottom">
-        <span>© 2026 CrMcDownload · 与 Mojang / Microsoft 无关</span>
+        <span>
+          © 2026 CrMcDownload · 与 Mojang / Microsoft 无关 ·
+          <RouterLink class="footer-legal" to="/privacy">隐私政策</RouterLink>
+        </span>
         <span>今天也要开心地开服喵～</span>
       </div>
     </div>
   </footer>
 </template>
+
+<style scoped>
+.footer-legal {
+  color: rgba(239, 231, 212, 0.78);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.footer-legal:hover {
+  color: #fff;
+}
+</style>

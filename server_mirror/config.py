@@ -144,8 +144,8 @@ class Settings:
     #: 官方特权插件（离线联机）可下载包的存放目录（GET /plugin/* 从此读取）
     plugin_dir: Path = DEFAULT_DATA_ROOT / "plugins"
     #: 更新配置：GitHub 仓库、最新/最低版本、是否强制、发布页与安装包文件名
-    update_repo: str = "crazying-dev/CrMcDownload"
-    update_latest: str = "0.7.0"
+    update_repo: str = "leaf-CatLin/CrMcDownload"
+    update_latest: str = "0.8.5"
     update_min: str = ""          # 空 = 不强制更新
     update_enforce: bool = True
     update_release_url: str = ""  # 空 = 按仓库 + tag 拼 GitHub Releases 页面
@@ -195,8 +195,8 @@ class Settings:
             p2p_udp_bytes_cap=_int(env, "MIRROR_P2P_UDP_BYTES_CAP", 512 * 1024 * 1024),
             p2p_edge_token_ttl=_int(env, "MIRROR_P2P_EDGE_TOKEN_TTL", 180),
             plugin_dir=Path(env.get("MIRROR_PLUGIN_DIR") or root / "plugins"),
-            update_repo=(env.get("MIRROR_UPDATE_REPO") or "crazying-dev/CrMcDownload").strip(),
-            update_latest=(env.get("MIRROR_UPDATE_LATEST_VERSION") or "0.7.0").strip(),
+            update_repo=(env.get("MIRROR_UPDATE_REPO") or "leaf-CatLin/CrMcDownload").strip(),
+            update_latest=(env.get("MIRROR_UPDATE_LATEST_VERSION") or "0.8.5").strip(),
             update_min=(env.get("MIRROR_UPDATE_MIN_VERSION") or "").strip(),
             update_enforce=(env.get("MIRROR_UPDATE_ENFORCE", "on").strip().lower()
                             not in ("0", "false", "no", "off")),

@@ -133,6 +133,92 @@ def test_report_rate_limited(router):
     assert 429 in codes                 # 令牌桶容量 10，第 11 次起被限
 
 
+def _complaint_body(**overrides) -> bytes:
+    payload = {"host": "bad.example", "port": 25565, "reason": "外挂", "detail": "详情",
+               "contact": "a@b.c", "client": "1.0"}
+    payload.update(overrides)
+    return json.dumps(payload).encode()
+
+
+def test_complaint_accepts_and_stores(router):
+    handle, db = router
+    status, _, data = _body(
+        handle.dispatch("POST", "/api/servers/complaints", {}, _complaint_body())
+    )
+    assert status == 200
+    assert data["ok"] is True and data["id"] > 0
+    items = db.list_complaints()
+    assert len(items) == 1
+    assert items[0]["host"] == "bad.example"
+    assert items[0]["port"] == 25565
+    assert items[0]["reason"] == "外挂"
+    assert items[0]["status"] == 0
+
+
+def test_complaint_requires_reason(router):
+    handle, db = router
+    for body in (
+        _complaint_body(reason=""),
+        _complaint_body(reason="   "),
+        json.dumps({"host": "bad.example"}).encode(),
+    ):
+        status, _, data = _body(
+            handle.dispatch("POST", "/api/servers/complaints", {}, body)
+        )
+        assert status == 400
+        assert "原因" in data["error"]
+    assert db.count_complaints() == 0
+
+
+def test_complaint_rejects_bad_address(router):
+    handle, _ = router
+    status, _, _ = _body(
+        handle.dispatch("POST", "/api/servers/complaints", {}, _complaint_body(host=""))
+    )
+    assert status == 400
+    status, _, _ = _body(
+        handle.dispatch("POST", "/api/servers/complaints", {}, _complaint_body(port=70000))
+    )
+    assert status == 400
+    status, _, _ = _body(handle.dispatch("POST", "/api/servers/complaints", {}, b"{not json"))
+    assert status == 400
+
+
+def test_complaint_get_not_allowed(router):
+    handle, _ = router
+    status, _, _ = _body(handle.dispatch("GET", "/api/servers/complaints", {}, None))
+    assert status == 405
+
+
+def test_complaint_requires_token_when_configured(tmp_path):
+    db = Database(tmp_path / "mirror.db")
+    handle = ApiRouter(settings=_Settings(token="secret"), db=db)
+    try:
+        status, _, _ = _body(
+            handle.dispatch("POST", "/api/servers/complaints", {}, _complaint_body())
+        )
+        assert status == 403
+        status, _, data = _body(
+            handle.dispatch(
+                "POST", "/api/servers/complaints",
+                {"x-offcraft-token": "secret"}, _complaint_body(),
+            )
+        )
+        assert status == 200 and data["id"] > 0
+        assert db.count_complaints() == 1
+    finally:
+        db.close()
+
+
+def test_complaint_rate_limited(router):
+    handle, _ = router
+    codes = [
+        _body(handle.dispatch("POST", "/api/servers/complaints", {}, _complaint_body()))[0]
+        for _ in range(15)
+    ]
+    assert 429 in codes                 # 与上报共用令牌桶，容量 10
+
+
 def test_stats_overview_merges_metrics(tmp_path):
     db = Database(tmp_path / "mirror.db")
     db.upsert_server("mc.example", 25565)

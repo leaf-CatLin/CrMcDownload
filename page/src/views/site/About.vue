@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { SITE_VERSION } from "@/api/client";
+import { latestVersion } from "@/api/client";
 </script>
 
 <template>
   <div>
     <section class="page-head">
       <div class="wrap">
-        <span class="eyebrow">ABOUT · v{{ SITE_VERSION }}</span>
+        <span class="eyebrow">ABOUT · v{{ latestVersion }}</span>
         <h1>关于 CrMcDownload</h1>
         <p>
           它最初只是一个「不想再等 Mojang 下载」的小工具，后来慢慢长成了启动器 + 镜像服务 +
@@ -89,7 +89,7 @@ import { SITE_VERSION } from "@/api/client";
             <h2>想来一起写代码吗？</h2>
             <p>Issue、PR、想法、甚至一句「喵」都欢迎。</p>
           </div>
-          <a class="btn" href="https://github.com/crazying-dev/CrMcDownload" target="_blank" rel="noreferrer">GitHub 仓库</a>
+          <a class="btn" href="https://github.com/leaf-CatLin/CrMcDownload" target="_blank" rel="noreferrer">GitHub 仓库</a>
         </div>
       </div>
     </section>

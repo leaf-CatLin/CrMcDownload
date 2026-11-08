@@ -41,10 +41,10 @@ def test_is_outdated_is_permissive_on_bad_input():
 def test_update_info_urls_and_payload():
     info = UpdateInfo(latest="0.7.0", minimum="0.7.0")
     assert info.tag == "v0.7.0"
-    assert info.page_url == "https://github.com/crazying-dev/CrMcDownload/releases/tag/v0.7.0"
+    assert info.page_url == "https://github.com/leaf-CatLin/CrMcDownload/releases/tag/v0.7.0"
     assert info.asset_name == "CrMCDownload-0.7.0-win64-setup.exe"
     assert info.direct_url.endswith("/v0.7.0/CrMCDownload-0.7.0-win64-setup.exe")
-    assert info.mirror_url.startswith("/github/crazying-dev/CrMcDownload/releases/download/")
+    assert info.mirror_url.startswith("/github/leaf-CatLin/CrMcDownload/releases/download/")
     payload = info.payload("0.6.2")
     assert payload["force_update"] is True and payload["ok"] is False
     assert info.payload("0.7.0")["force_update"] is False
@@ -80,7 +80,7 @@ def test_update_info_reads_settings_defaults():
         token: str = ""
 
     info = update_info(_S())
-    assert info.latest == "0.7.0"
+    assert info.latest == "0.8.5"
     assert info.minimum == ""
 
 

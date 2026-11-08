@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 
@@ -166,3 +167,63 @@ def test_prune_history_removes_old(db):
     db.record_ping("mc.example", 25565, ok=True, ts=time.time())
     removed = db.prune_history(keep_days=7)
     assert removed == 1
+
+
+def test_schema_upgrade_creates_complaints_table(tmp_path):
+    """老库（v2）重新打开后升到 v3 并建出 ``server_complaints``。"""
+    path = tmp_path / "mirror.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);"
+        "INSERT INTO schema_version(version) VALUES (2);"
+    )
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    try:
+        assert db._conn.execute("SELECT version FROM schema_version").fetchone()["version"] == SCHEMA_VERSION
+        assert db._table_exists("server_complaints")
+        assert db.count_complaints() == 0
+    finally:
+        db.close()
+
+
+def test_add_and_list_complaints(db):
+    first = db.add_complaint(
+        "MC.Example", 25565, "  外挂服  ", detail="详情", contact="a@b.c", client="1.0"
+    )
+    second = db.add_complaint("mc.example", 25566, "诈骗")
+    assert first >= 1 and second > first
+    assert db.count_complaints() == 2
+    items = db.list_complaints()
+    assert len(items) == 2
+    assert items[0]["id"] == second                  # 新的在前
+    row = next(item for item in items if item["id"] == first)
+    assert row["host"] == "mc.example"               # 归一小写
+    assert row["port"] == 25565
+    assert row["reason"] == "外挂服"
+    assert row["detail"] == "详情"
+    assert row["contact"] == "a@b.c"
+    assert row["client"] == "1.0"
+    assert row["status"] == 0
+    assert row["created_at"] > 0
+
+
+def test_complaint_truncates_and_limits(db):
+    long_reason = "原" * 40
+    db.add_complaint("mc.example", 25565, long_reason, detail="d" * 600)
+    assert db.list_complaints(limit=10)[0]["reason"] == "原" * 24
+    assert len(db.list_complaints(limit=10)[0]["detail"]) == 500
+    assert db.list_complaints(limit=0) == []
+
+
+def test_set_complaint_status_records_handler(db):
+    complaint_id = db.add_complaint("mc.example", 25565, "广告")
+    assert db.set_complaint_status(complaint_id, 1, "admin") == 1
+    row = db.list_complaints(status=1)[0]
+    assert row["status"] == 1
+    assert row["handled_by"] == "admin"
+    assert row["handled_at"] > 0
+    assert db.count_complaints(status=0) == 0
+    assert db.count_complaints(status=1) == 1
+    assert db.set_complaint_status(9999, 2, "admin") == 0   # 不存在的 id
