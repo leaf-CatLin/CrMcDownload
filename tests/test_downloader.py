@@ -1,5 +1,6 @@
 import hashlib
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +56,89 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.end_headers()
         self.wfile.write(body)
+
+
+class _DripHandler(BaseHTTPRequestHandler):
+    """支持 Range，但按块 + 间隔发送，模拟「出口很窄」的下载源。"""
+
+    chunk = 64 * 1024
+    delay = 0.05
+    hits: list[tuple[str, str | None]] = []
+
+    def log_message(self, *args):  # noqa: D401 - 静默
+        pass
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler 约定
+        _DripHandler.hits.append((self.path, self.headers.get("Range")))
+        data = PAYLOAD
+        range_header = self.headers.get("Range")
+        start = 0
+        if range_header and range_header.startswith("bytes="):
+            start = int(range_header.split("=", 1)[1].split("-", 1)[0] or 0)
+            if start >= len(data):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(data)}")
+                self.end_headers()
+                return
+            body = data[start:]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+        else:
+            body = data
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        try:
+            for offset in range(0, len(body), self.chunk):
+                self.wfile.write(body[offset : offset + self.chunk])
+                time.sleep(self.delay)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class SlowSwitchTest(unittest.TestCase):
+    """下载过慢时保留断点并切换到更快的源。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fast = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.slow = ThreadingHTTPServer(("127.0.0.1", 0), _DripHandler)
+        for server in (cls.fast, cls.slow):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        cls.fast_base = f"http://127.0.0.1:{cls.fast.server_address[1]}"
+        cls.slow_base = f"http://127.0.0.1:{cls.slow.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for server in (cls.fast, cls.slow):
+            server.shutdown()
+            server.server_close()
+
+    def test_slow_download_switches_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "a.bin"
+            _Handler.hits.clear()
+            _DripHandler.hits.clear()
+            task = DownloadTask(
+                f"{self.slow_base}/a", dest, PAYLOAD_SHA1, len(PAYLOAD)
+            )
+            fast_url = f"{self.fast_base}/a"
+            downloader = Downloader(
+                workers=1,
+                retries=0,
+                slow_threshold=5 * 1024 * 1024,
+                slow_window=0.05,
+                slow_warmup=0.0,
+                slow_min_bytes=0,
+                stall_switches=1,
+                url_resolver=lambda url: fast_url if self.slow_base in url else None,
+            )
+            report = downloader.run([task])
+            self.assertTrue(report.ok, report.failed)
+            self.assertEqual(dest.read_bytes(), PAYLOAD)
+            self.assertTrue(_DripHandler.hits, "应先走慢速源")
+            self.assertTrue(_Handler.hits, "过慢后应切换到快速源")
 
 
 class DownloaderTest(unittest.TestCase):

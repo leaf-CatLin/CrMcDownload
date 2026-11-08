@@ -28,6 +28,31 @@ from .crypto import (
 from .room import PeerInfo, RoomClient
 from .transport import FrameReader, RelayTransport, SecureChannel
 from .tunnel import HostTunnel, JoinTunnel, forward
+from .vip import (
+    VIP_HOST,
+    VIP_PREFIX,
+    derive_peer_vip,
+    display_vip,
+    is_vip,
+    vip_number,
+)
+from .vpn_client import (
+    VpnClient,
+    VpnClientError,
+    VpnPeerStatus,
+    VpnStatus,
+    build_config,
+    derive_peer_keys,
+    try_create,
+    PIPE_NAME,
+)
+from .port_probe import (
+    DEFAULT_MC_PORT,
+    detect_from_log,
+    detect_local_mc_port,
+    is_listening,
+    read_log_tail,
+)
 
 __all__ = [
     "P2PError",
@@ -48,4 +73,23 @@ __all__ = [
     "JoinTunnel",
     "HostTunnel",
     "forward",
+    "VIP_PREFIX",
+    "VIP_HOST",
+    "is_vip",
+    "vip_number",
+    "display_vip",
+    "derive_peer_vip",
+    "PIPE_NAME",
+    "VpnClient",
+    "VpnClientError",
+    "VpnStatus",
+    "VpnPeerStatus",
+    "derive_peer_keys",
+    "build_config",
+    "try_create",
+    "DEFAULT_MC_PORT",
+    "detect_from_log",
+    "detect_local_mc_port",
+    "is_listening",
+    "read_log_tail",
 ]

@@ -1,11 +1,15 @@
 """Server List Ping：用标准库 socket 读取服务器状态。
 
-协议（Java 版 Handshaking → Login 阶段，``protocol=-1`` 表示不关心具体版本）：
+协议（Java 版 Status 阶段，``protocol=-1`` 表示不关心具体版本）：
 
 1. ``Handshake``：``varint packetId(0x00) + varint protocol(-1) +
    varint string serverID + u16 port + varint nextState(1)``
-2. ``Login Start``：``varint packetId(0x00) + varint string name``
-3. 服务器回 ``varint 长度 + JSON Response``
+2. ``Status Request``：``varint packetId(0x00)``，**不带任何字段**
+3. 服务器回 ``varint 帧长 + varint packetId(0x00) + varint strlen + JSON``
+
+注意不能再把 ``Login Start``（``0x00 + 名字``）当状态请求发：Vanilla 会忽略多余
+字节，但 Velocity / BungeeCord 等严格实现会直接断开连接（表现为「连接被对方
+关闭」或一直挂到超时）。响应也必须先跳过 packetId 与字符串长度前缀再解析 JSON。
 
 无鉴权、不加密，因此离线账户也能探测在线模式服务器。``players.sample`` 是否
 存在由服务器决定（1.19+ 开启 ``enforce-secure-profile`` 或装了隐藏插件的服务器
@@ -194,8 +198,11 @@ def _varint_string(text: str) -> bytes:
     return encode_varint(len(payload)) + payload
 
 
-def handshake_packet(host: str, port: int, name: str) -> tuple[bytes, bytes]:
-    """分别返回 ``(login_start 包, handshake 包)``，两个包一次性发出，省一个 RTT。"""
+STATUS_REQUEST = b"\x01\x00"  # length=1, packetId=0x00，不带字段
+
+
+def handshake_packet(host: str, port: int) -> bytes:
+    """Handshake 包：nextState=1 进入 Status 阶段。"""
     body = (
         encode_varint(0x00)
         + encode_varint(-1)
@@ -203,16 +210,16 @@ def handshake_packet(host: str, port: int, name: str) -> tuple[bytes, bytes]:
         + int(port).to_bytes(2, "big")
         + encode_varint(1)
     )
-    handshake = encode_varint(len(body)) + body
-    login_body = encode_varint(0x00) + _varint_string(name)
-    login = encode_varint(len(login_body)) + login_body
-    return login, handshake
+    return encode_varint(len(body)) + body
 
 
 def build_request(host: str, port: int, name: str = "OffCraft") -> bytes:
-    """拼出完整的探测请求字节流（Handshake 在前，Login Start 在后）。"""
-    login, handshake = handshake_packet(host, port, name)
-    return handshake + login
+    """Handshake + Status Request，一次发出、省一个 RTT。
+
+    ``name`` 仅为兼容旧调用保留，不再发送：状态阶段发 Login Start 会被严格
+    服务端（Velocity / BungeeCord）判定为协议错误并断开。
+    """
+    return handshake_packet(host, port) + STATUS_REQUEST
 
 
 def _read_exact(sock: socket.socket, count: int) -> bytes:
@@ -233,6 +240,24 @@ def _read_varint_from_socket(sock: socket.socket) -> int:
         if not chunk & 0x80:
             return value
     raise ValueError("VarInt 超过 5 字节")
+
+
+def _read_status_json(sock: socket.socket) -> bytes:
+    """读一帧状态响应：``帧长 → packetId(0x00) → 字符串长度 → JSON``。"""
+    length = _read_varint_from_socket(sock)
+    if length <= 0:
+        raise ValueError("响应为空")
+    if length > MAX_JSON_BYTES:
+        raise ValueError(f"响应过大（{length} 字节）")
+    frame = _read_exact(sock, length)
+    packet_id, offset = read_varint(frame)
+    if packet_id != 0x00:
+        raise ValueError(f"响应包 id 异常（0x{packet_id:02x}）")
+    size, step = read_varint(frame[offset:])
+    offset += step
+    if size <= 0 or len(frame) < offset + size:
+        raise ValueError("响应 JSON 长度不完整")
+    return frame[offset : offset + size]
 
 
 # ------------------------------------------------------------------- 解析
@@ -336,12 +361,7 @@ def slp_probe(
         else:
             sock.connect((host, port))
         sock.sendall(build_request(host, port, name))
-        length = _read_varint_from_socket(sock)
-        if length <= 0:
-            return _failed(host, port, "服务器返回空响应，可能不是 Minecraft 服务器", started=started)
-        if length > MAX_JSON_BYTES:
-            return _failed(host, port, f"服务器响应过大（{length} 字节）", started=started)
-        payload = _read_exact(sock, length)
+        payload = _read_status_json(sock)
         latency_ms = (time.perf_counter() - started) * 1000.0
         try:
             data = json.loads(payload.decode("utf-8", "replace"))

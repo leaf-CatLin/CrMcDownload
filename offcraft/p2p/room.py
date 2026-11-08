@@ -34,6 +34,8 @@ class PeerInfo:
     addr: str
     world: str = ""
     port: int = 0
+    vip: str = ""       # 虚拟 IP（10.66.0.x）；服务端未启用 VPN 时为空
+    udp: str = ""       # UDP 边缘登记的观测端点 "ip:port"；未登记为空
 
     @classmethod
     def from_roster(cls, item: dict[str, Any]) -> "PeerInfo":
@@ -42,6 +44,8 @@ class PeerInfo:
             addr=str(item.get("addr") or ""),
             world=str(item.get("world") or ""),
             port=int(item.get("port") or 0),
+            vip=str(item.get("vip") or ""),
+            udp=str(item.get("udp") or ""),
         )
 
 
@@ -59,8 +63,13 @@ class RoomClient:
     nonce: str = field(init=False, default="")
     sid: str = field(init=False, default="")
     host_sid: str = field(init=False, default="")
+    host_secret: str = field(init=False, default="")   # 仅房主 open 时下发；kick 鉴权用
     peers: list[PeerInfo] = field(init=False, default_factory=list)
     relay: dict[str, Any] = field(init=False, default_factory=dict)
+    vip: str = field(init=False, default="")          # 本端虚拟 IP；服务端未启用 VPN 时为空
+    host_vip: str = field(init=False, default="")     # 房主虚拟 IP（加入者据此直连）
+    edge: dict[str, Any] = field(init=False, default_factory=dict)   # UDP 边缘 {host, port}
+    edge_token: str = field(init=False, default="")   # 本端边缘令牌（名册轮询会刷新）
 
     def __post_init__(self) -> None:
         self.name = canonical_name(self.name)
@@ -82,7 +91,21 @@ class RoomClient:
         self.host_sid = str(resp.get("host") or "")
         self.relay = dict(resp.get("relay") or {})
         self.peers = [PeerInfo.from_roster(p) for p in (resp.get("peers") or [])]
+        self._apply_vpn(resp)
         return resp
+
+    def _apply_vpn(self, resp: dict[str, Any]) -> None:
+        """吸收服务端下发的 VPN 字段（open/join/roster/announce 共用）。"""
+        if resp.get("vip"):
+            self.vip = str(resp["vip"])
+        if resp.get("host_vip"):
+            self.host_vip = str(resp["host_vip"])
+        elif self.vip and not self.host_vip:
+            self.host_vip = self.vip          # 房主本人的 vip 即 host_vip
+        if resp.get("edge"):
+            self.edge = dict(resp["edge"])
+        if resp.get("edge_token"):
+            self.edge_token = str(resp["edge_token"])
 
     # -------------------------------------------------------------- 房间管理
     def create(self) -> dict[str, Any]:
@@ -108,7 +131,49 @@ class RoomClient:
             "port": self.port,
             "device_id": self.device_id,
         })
+        self.host_secret = str(resp.get("host_secret") or "")
         return self._apply_join(resp)
+
+    def roster(self) -> dict[str, Any]:
+        """拉取当前会话在线名册（只读，任何在房成员可查）；回写本地 peers。"""
+        resp = self._post("roster", {"room": self.name, "sid": self.sid})
+        self.peers = [PeerInfo.from_roster(p) for p in (resp.get("peers") or [])]
+        self._apply_vpn(resp)
+        return resp
+
+    def kick(self, target_sid: str) -> dict[str, Any]:
+        """房主踢出一个在线成员（靠 open 下发的 host_secret 鉴权）。仅房主会话可用。"""
+        if not self.host_secret:
+            raise ValueError("仅房主可踢出成员（缺少控制口令）。")
+        return self._post("kick", {
+            "room": self.name,
+            "sid": self.sid,
+            "host_secret": self.host_secret,
+            "target": target_sid,
+        })
+
+    def rekey(self, new_password: str) -> dict[str, Any]:
+        """房主重置房间密码：服务端更新 auth_key 并清出所有非房主成员。
+
+        成功后本地才切换密钥；旧成员立即掉线，且只有拿到新密码的设备能重新加入。
+        """
+        if not self.host_secret:
+            raise ValueError("仅房主可重置密码（缺少控制口令）。")
+        new_password = str(new_password or "")
+        if not new_password:
+            raise ValueError("新密码不能为空")
+        new_keys = derive_room_keys(new_password, self.name)
+        resp = self._post("rekey", {
+            "room": self.name,
+            "sid": self.sid,
+            "host_secret": self.host_secret,
+            "auth_key": new_keys.auth_key.hex(),
+        })
+        if resp.get("ok"):
+            self.password = new_password
+            self.keys = new_keys
+            self.peers = [PeerInfo.from_roster(p) for p in (resp.get("peers") or [])]
+        return resp
 
     def join(self) -> dict[str, Any]:
         """加入者凭 proof 进入已开放会话；房间不存在/未开放由服务端报错，绝不自动建房。"""
@@ -128,7 +193,9 @@ class RoomClient:
             "world": self.world if world is None else world,
             "port": self.port if port is None else port,
         }
-        return self._post("announce", payload)
+        resp = self._post("announce", payload)
+        self._apply_vpn(resp)
+        return resp
 
     def request_relay(self, target_sid: str) -> dict[str, Any]:
         payload = {"room": self.name, "sid": self.sid, "peer": target_sid}

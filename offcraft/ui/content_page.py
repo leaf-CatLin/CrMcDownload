@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QParallelAnimationGroup,
+    QPoint,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+)
+from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -30,7 +40,9 @@ from offcraft.content.target import (
     target_state,
 )
 from offcraft.instances import read_pack_metadata
-from offcraft.ui.theme import MUTED, human_count, initial_pixmap
+from offcraft.ui.icons import icon_pixmap
+from offcraft.ui.spinner import Spinner
+from offcraft.ui.theme import ACCENT, MUTED, human_count, initial_pixmap
 from offcraft.ui.widgets import Badge, Card, ContentRow, ElidedLabel
 
 __all__ = ["ContentPage", "KINDS"]
@@ -60,6 +72,14 @@ LOADER_CHOICES = [
     ("Quilt", "quilt"),
 ]
 
+#: 缓存有效期 = 静默刷新周期（秒）：下载页每 100 秒重新拉取一次
+CACHE_SECONDS = 100.0
+#: 列表插入 / 退出动画时长（毫秒）
+ANIM_MS = 100
+#: 右侧详情卡片宽度与展开/收起动画时长（毫秒）
+DETAIL_W = 292
+DETAIL_MS = 180
+
 
 class ContentPage(QWidget):
     def __init__(self, window: Any, kind: str) -> None:
@@ -78,6 +98,15 @@ class ContentPage(QWidget):
         self._last_target_key = ""
         self._token = 0
         self._loaded = False
+        #: 每个筛选条件组合的独立缓存：key -> (时间戳, 搜索结果)
+        self._cache: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
+        #: 是否有请求正在进行（静默刷新遇到在途请求时跳过，避免相互取消）
+        self._requesting = False
+        #: 列表动画分组与退出动画的残影控件（防止被 GC）
+        self._anims: list[QParallelAnimationGroup] = []
+        self._ghosts: list[QLabel] = []
+        #: 右侧详情卡片的展开/收起动画（默认收起，点击列表项才展开）
+        self._detail_anim: QPropertyAnimation | None = None
         self._build()
 
     # ------------------------------------------------------------------ UI
@@ -126,6 +155,8 @@ class ContentPage(QWidget):
 
         button = QPushButton("搜索")
         button.setObjectName("accent")
+        button.setIcon(QIcon(icon_pixmap("search", 16, "#FFFFFF")))
+        button.setIconSize(QSize(16, 16))
         button.clicked.connect(self.reload)
         row.addWidget(button)
         filters.add_layout(row)
@@ -135,24 +166,45 @@ class ContentPage(QWidget):
         body.setSpacing(12)
 
         results = Card(margins=(8, 8, 8, 8))
+        # 加载动画（uiball ldrs ring 风格）：列表为空时占据列表位置
+        self.loading_box = QWidget()
+        loading_layout = QVBoxLayout(self.loading_box)
+        loading_layout.setContentsMargins(0, 0, 0, 0)
+        loading_layout.setSpacing(10)
+        loading_layout.addStretch(1)
+        self.spinner = Spinner(38, ACCENT)
+        loading_layout.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.loading_text = self._label("正在加载……", "muted")
+        self.loading_text.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        loading_layout.addWidget(self.loading_text)
+        loading_layout.addStretch(1)
+        self.loading_box.setVisible(False)
         self.list = QListWidget()
         self.list.setSpacing(2)
         self.list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        self.list.itemClicked.connect(self._on_select)
+        self.list.setVisible(False)
+        # 单击（而非程序化选中）才展开右侧详情
+        self.list.itemClicked.connect(self._on_row_clicked)
+        results.add(self.loading_box, 1)
         results.add(self.list, 1)
         footer = QHBoxLayout()
         self.count_label = self._label("", "muted")
         footer.addWidget(self.count_label)
         footer.addStretch(1)
         self.more_button = QPushButton("加载更多")
+        self.more_button.setIcon(QIcon(icon_pixmap("download", 15, "#5B6678")))
+        self.more_button.setIconSize(QSize(15, 15))
         self.more_button.clicked.connect(lambda: self.load_more())
         self.more_button.setVisible(False)
         footer.addWidget(self.more_button)
         results.add_layout(footer)
         body.addWidget(results, 1)
 
-        detail = Card(margins=(16, 16, 16, 16))
-        detail.setFixedWidth(292)
+        self.detail = Card(margins=(16, 16, 16, 16))
+        # 默认收起：宽度动画到 0，点击列表项后再展开
+        self.detail.setMinimumWidth(0)
+        self.detail.setMaximumWidth(0)
+        self.detail.setVisible(False)
         top = QHBoxLayout()
         top.setSpacing(10)
         self.detail_icon = QLabel()
@@ -167,6 +219,16 @@ class ContentPage(QWidget):
         self.detail_author = self._label("", "muted")
         names.addWidget(self.detail_author)
         top.addLayout(names, 1)
+        self.detail_collapse = QPushButton()
+        self.detail_collapse.setObjectName("iconBtn")
+        self.detail_collapse.setFixedSize(26, 26)
+        self.detail_collapse.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.detail_collapse.setIcon(QIcon(icon_pixmap("chevron-right", 15, MUTED)))
+        self.detail_collapse.setIconSize(QSize(15, 15))
+        self.detail_collapse.setToolTip("收起详情")
+        self.detail_collapse.clicked.connect(self.collapse_detail)
+        top.addWidget(self.detail_collapse)
+        detail = self.detail
         detail.add_layout(top)
 
         self.detail_badges = QHBoxLayout()
@@ -207,11 +269,15 @@ class ContentPage(QWidget):
         self.install_button = QPushButton("安装所选版本")
         self.install_button.setObjectName("accent")
         self.install_button.setFixedHeight(40)
+        self.install_button.setIcon(QIcon(icon_pixmap("download", 16, "#FFFFFF")))
+        self.install_button.setIconSize(QSize(16, 16))
         self.install_button.clicked.connect(self.install_selected)
         self.install_button.setEnabled(False)
         detail.add(self.install_button)
 
         self.open_button = QPushButton("在 Modrinth 查看")
+        self.open_button.setIcon(QIcon(icon_pixmap("globe", 15, "#5B6678")))
+        self.open_button.setIconSize(QSize(15, 15))
         self.open_button.clicked.connect(self._open_page)
         self.open_button.setEnabled(False)
         detail.add(self.open_button)
@@ -219,7 +285,7 @@ class ContentPage(QWidget):
         self.detail_hint.setWordWrap(True)
         detail.add(self.detail_hint)
 
-        body.addWidget(detail)
+        body.addWidget(self.detail)
         root.addLayout(body, 1)
 
     @staticmethod
@@ -227,6 +293,57 @@ class ContentPage(QWidget):
         label = QLabel(text)
         label.setObjectName(name)
         return label
+
+    # -------------------------------------------------------------- 详情卡片
+    def _on_row_clicked(self, item: QListWidgetItem) -> None:
+        """用户单击列表项：填充详情并展开右侧卡片。"""
+        self._on_select(item)
+        self.expand_detail()
+
+    def expand_detail(self) -> None:
+        if not self.detail.isVisible():
+            self.detail.setMaximumWidth(0)
+            self.detail.setVisible(True)
+        if self.detail.maximumWidth() >= DETAIL_W and self._detail_anim is None:
+            return
+        self._animate_detail(DETAIL_W)
+
+    def collapse_detail(self) -> None:
+        if not self.detail.isVisible() or self._detail_anim is not None:
+            return
+        self._animate_detail(0)
+
+    def _animate_detail(self, target: int) -> None:
+        self._stop_detail_anim()
+        anim = QPropertyAnimation(self.detail, b"maximumWidth", self)
+        anim.setDuration(DETAIL_MS)
+        anim.setStartValue(self.detail.maximumWidth())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(lambda: self._detail_finished(target))
+        self._detail_anim = anim
+        anim.start()
+
+    def _detail_finished(self, target: int) -> None:
+        self._detail_anim = None
+        if target <= 0:
+            self.detail.setVisible(False)
+            self.detail.setMaximumWidth(0)
+
+    def _stop_detail_anim(self) -> None:
+        if self._detail_anim is not None:
+            self._detail_anim.stop()
+            self._detail_anim = None
+
+    def _set_loading(self, loading: bool, text: str = "正在加载……") -> None:
+        """切换「加载动画 / 列表」两种状态（有旧结果时保持列表可见）。"""
+        self.loading_text.setText(text)
+        if loading:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+        self.loading_box.setVisible(loading)
+        self.list.setVisible(not loading)
 
     # ----------------------------------------------------------------- data
     def refresh(self) -> None:
@@ -240,6 +357,13 @@ class ContentPage(QWidget):
             self.refresh()
             return
         self.sync_filters()
+        if not self.hits:
+            self.reload()
+            return
+        # 已有内容：超出缓存有效期就静默刷新（不重绘，完成后再做增删动画）
+        cached = self._cache.get(self._cache_key())
+        if cached is None or time.time() - cached[0] > CACHE_SECONDS:
+            self.live_refresh()
         if self.selected is None and self.hits:
             self.list.setCurrentRow(0)
             item = self.list.item(0)
@@ -252,6 +376,40 @@ class ContentPage(QWidget):
     def sync_filters(self) -> None:
         """只刷新筛选框（不触发新的网络请求）。"""
         self._refresh_filters()
+
+    def live_refresh(self) -> None:
+        """100 秒静默刷新：请求完成前保持界面不变，完成后按差异做插入/退出动画。"""
+        if not self._loaded or self._requesting:
+            return
+        query, game_version, loader, index = self._filters()
+        key = self._cache_key()
+        token = self._token
+        self._requesting = True
+
+        def worker() -> None:
+            try:
+                result = self.window.content_client().search(
+                    query,
+                    self.kind,
+                    game_version=game_version,
+                    loader=loader,
+                    limit=20,
+                    offset=0,
+                    index=index,
+                )
+            except Exception:  # noqa: BLE001 - 静默刷新失败保持现状，不打扰浏览
+                self.window.post(lambda: self._live_failed(token))
+                return
+            self.window.post(lambda: self._apply_result(token, result, False, key))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _live_failed(self, token: int) -> None:
+        if token == self._token:
+            self._requesting = False
+
+    def _cache_key(self) -> tuple[str, str, str, str]:
+        return self._filters()
 
     def _mc_dir(self) -> Path:
         return self.window.game_dir()
@@ -435,13 +593,18 @@ class ContentPage(QWidget):
         )
 
     def reload(self) -> None:
+        """筛选变化 / 手动搜索：优先用缓存；没有缓存时后台拉取，完成前不清空列表。"""
+        self._token += 1
         self.offset = 0
-        self.hits = []
-        self.list.clear()
-        self.rows = []
-        self.selected = None
-        self.more_button.setVisible(False)
-        self.count_label.setText("正在搜索……")
+        key = self._cache_key()
+        cached = self._cache.get(key)
+        if cached is not None and time.time() - cached[0] <= CACHE_SECONDS:
+            self._requesting = False
+            self._apply_result(self._token, cached[1], False, key)
+            return
+        if not self.hits:
+            self._set_loading(True, "正在搜索……")
+            self.more_button.setVisible(False)
         self._search(append=False)
 
     def load_more(self) -> None:
@@ -451,7 +614,10 @@ class ContentPage(QWidget):
 
     def _search(self, *, append: bool) -> None:
         query, game_version, loader, index = self._filters()
+        key = self._cache_key()
         token = self._token = self._token + 1
+        offset = self.offset
+        self._requesting = True
         self.more_button.setEnabled(False)
 
         def worker() -> None:
@@ -462,7 +628,7 @@ class ContentPage(QWidget):
                     game_version=game_version,
                     loader=loader,
                     limit=20,
-                    offset=self.offset,
+                    offset=offset,
                     index=index,
                 )
             except ContentError as exc:
@@ -471,40 +637,196 @@ class ContentPage(QWidget):
             except Exception as exc:  # noqa: BLE001
                 self.window.post(lambda: self._search_failed(token, f"搜索失败：{exc}"))
                 return
-            self.window.post(lambda: self._apply(token, result, append))
+            self.window.post(lambda: self._apply_result(token, result, append, key))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply(self, token: int, result, append: bool) -> None:
+    def _apply_result(self, token: int, result, append: bool, key) -> None:
+        """把网络结果与当前列表做差异比对，只对新增/移除的行做 100ms 动画。"""
         if token != self._token:
             return
+        self._requesting = False
         if not append:
-            self.list.clear()
-            self.rows = []
-            self.hits = []
+            self._set_loading(False)
         self.total = result.total
         self.offset = result.offset + len(result.hits)
-        for hit in result.hits:
+        if not append:
+            self._cache[key] = (time.time(), result)
+            if len(self._cache) > 24:
+                # 独立缓存按筛选组合分开存放，超出上限时丢弃最久未更新的组合
+                oldest = min(self._cache, key=lambda item: self._cache[item][0])
+                self._cache.pop(oldest, None)
+
+        old_hits = list(self.hits)
+        if append:
+            final_hits = old_hits + list(result.hits)
+        else:
+            final_hits = list(result.hits)
+
+        old_ids = [hit.id for hit in old_hits]
+        new_ids = [hit.id for hit in final_hits]
+        # 静默刷新且顺序完全一致：只更新计数，不重绘列表
+        if not append and old_ids == new_ids:
+            self.selected = next(
+                (hit for hit in final_hits if self.selected and hit.id == self.selected.id),
+                self.selected,
+            )
+            self._update_count()
+            self.more_button.setVisible(self.offset < self.total)
+            self.more_button.setEnabled(True)
+            self.mode_badge.setText(f"Modrinth · {self.window.content_client().api_mode}")
+            return
+
+        inserted = [index for index, hit in enumerate(final_hits) if hit.id not in old_ids]
+        removed = [index for index, hit in enumerate(old_hits) if hit.id not in new_ids]
+        old_tops = self._capture_positions()
+        ghosts = self._ghost_pixmaps(removed)
+
+        selected_id = self.selected.id if self.selected is not None else ""
+        self._stop_anims()
+        self.list.clear()
+        self.rows = []
+        self.hits = final_hits
+        for hit in final_hits:
             item = QListWidgetItem()
             row = ContentRow(hit)
             item.setSizeHint(row.sizeHint())
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
-            self.hits.append(hit)
             self.rows.append(row)
             if hit.icon_url:
-                self.window.request_icon(self.window.content_client().resolve_url(hit.icon_url), row.set_icon)
-        self.count_label.setText(f"共 {human_count(self.total)} 个结果，已加载 {len(self.hits)}")
+                self.window.request_icon(
+                    self.window.content_client().resolve_url(hit.icon_url), row.set_icon
+                )
+
+        self._update_count()
         self.more_button.setVisible(self.offset < self.total)
         self.more_button.setEnabled(True)
         self.mode_badge.setText(f"Modrinth · {self.window.content_client().api_mode}")
-        if self.list.count() and self.selected is None:
+
+        keep = next(
+            (index for index, hit in enumerate(final_hits) if hit.id == selected_id), -1
+        )
+        if keep >= 0:
+            self.selected = final_hits[keep]
+            self.list.setCurrentRow(keep)
+        elif final_hits:
+            self.selected = None
             self.list.setCurrentRow(0)
             self._on_select(self.list.item(0))
+        else:
+            self.selected = None
+
+        if inserted or removed:
+            QTimer.singleShot(
+                0, lambda: self._animate_rows(old_tops, ghosts, inserted)
+            )
+
+    def _update_count(self) -> None:
+        self.count_label.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.count_label.setText(
+            f"共 {human_count(self.total)} 个结果，已加载 {len(self.hits)}"
+        )
+
+    def _capture_positions(self) -> dict[str, int]:
+        """记录当前每行在视口中的纵向位置，用于“下方内容上下运动”动画。"""
+        tops: dict[str, int] = {}
+        for index in range(min(len(self.rows), len(self.hits))):
+            item = self.list.item(index)
+            if item is None:
+                continue
+            tops[self.hits[index].id] = self.list.visualItemRect(item).top()
+        return tops
+
+    def _ghost_pixmaps(self, removed: list[int]) -> dict[str, tuple[object, object]]:
+        """给即将被移除的行拍一张快照，用于“向右退出窗口”的残影动画。"""
+        ghosts: dict[str, tuple[object, object]] = {}
+        viewport = self.list.viewport()
+        for index in removed:
+            if not 0 <= index < min(len(self.rows), len(self.hits)):
+                continue
+            item = self.list.item(index)
+            if item is None:
+                continue
+            rect = self.list.visualItemRect(item)
+            if rect.height() <= 0 or rect.width() <= 0:
+                continue
+            if rect.bottom() < 0 or rect.top() > viewport.height():
+                continue
+            ghosts[self.hits[index].id] = (self.rows[index].grab(), rect)
+        return ghosts
+
+    def _stop_anims(self) -> None:
+        for anim in self._anims:
+            anim.stop()
+        self._anims = []
+        for ghost in self._ghosts:
+            ghost.deleteLater()
+        self._ghosts = []
+
+    def _animate_rows(
+        self, old_tops: dict[str, int], ghosts: dict[str, tuple[object, object]], inserted: list[int]
+    ) -> None:
+        """插入：新行从右侧滑入且下方内容下沉；退出：残影右移且下方内容上移。"""
+        if not self.hits and not ghosts:
+            return
+        viewport = self.list.viewport()
+        width = max(viewport.width(), 1)
+        group = QParallelAnimationGroup(self)
+        inserted_set = set(inserted)
+
+        for index, hit in enumerate(self.hits):
+            item = self.list.item(index)
+            if item is None or index >= len(self.rows):
+                continue
+            row = self.rows[index]
+            top = self.list.visualItemRect(item).top()
+            if index in inserted_set:
+                row.move(width, top)
+                animation = QPropertyAnimation(row, b"pos", group)
+                animation.setDuration(ANIM_MS)
+                animation.setStartValue(QPoint(width, top))
+                animation.setEndValue(QPoint(0, top))
+                animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+                group.addAnimation(animation)
+                continue
+            old_top = old_tops.get(hit.id)
+            if old_top is None or abs(old_top - top) < 1:
+                continue
+            row.move(0, old_top)
+            animation = QPropertyAnimation(row, b"pos", group)
+            animation.setDuration(ANIM_MS)
+            animation.setStartValue(QPoint(0, old_top))
+            animation.setEndValue(QPoint(0, top))
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(animation)
+
+        for pixmap, rect in ghosts.values():
+            ghost = QLabel(viewport)
+            ghost.setPixmap(pixmap)
+            ghost.setGeometry(rect)
+            ghost.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            ghost.show()
+            ghost.raise_()
+            animation = QPropertyAnimation(ghost, b"pos", group)
+            animation.setDuration(ANIM_MS)
+            animation.setStartValue(rect.topLeft())
+            animation.setEndValue(QPoint(width + 4, rect.top()))
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(animation)
+            self._ghosts.append(ghost)
+
+        if group.animationCount() == 0:
+            return
+        group.finished.connect(self._stop_anims)
+        self._anims = [group]
+        group.start()
 
     def _search_failed(self, token: int, message: str) -> None:
         if token != self._token:
             return
+        self._requesting = False
+        self._set_loading(False)
         self.count_label.setText(message)
         self.count_label.setObjectName("error")
         self.count_label.setStyleSheet(f"color: #C2453F; font-size: 9pt;")
@@ -530,9 +852,14 @@ class ContentPage(QWidget):
         while self.detail_badges.count():
             widget = self.detail_badges.takeAt(0).widget()
             if widget is not None:
+                # 先隐藏再延迟删除：deleteLater 要等事件循环才生效，
+                # 期间旧徽标仍会画在原位置
+                widget.hide()
                 widget.deleteLater()
         for category in hit.categories[:3]:
-            self.detail_badges.addWidget(Badge(category, "gray"))
+            # 显式指定父控件：嵌套布局里的新控件若还是顶层窗口，会以 640×480
+            # 的默认尺寸盖住整张详情卡片
+            self.detail_badges.addWidget(Badge(category, "gray", self.detail))
         self.detail_badges.addStretch(1)
         self.open_button.setEnabled(True)
         if self.kind == "modpack":

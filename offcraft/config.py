@@ -32,6 +32,8 @@ def config_dir(explicit: str | Path | None = None) -> Path:
 class Config:
     schema: int = SCHEMA
     download_base: str = "https://mc.yjlt.top"
+    #: 多个下载源（空串表示官方直连）；首个非空项同时用于皮肤/联机等自有接口
+    download_sources: list[str] = field(default_factory=list)
     download_token: str = ""
     #: 允许下载整合包里指向未知主机的地址（默认关闭，只放行白名单域）
     allow_untrusted_sources: bool = False
@@ -55,16 +57,24 @@ class Config:
     recent_dirs: list[str] = field(default_factory=list)
     window: dict[str, int] = field(default_factory=lambda: {"w": 1180, "h": 760})
     java_cache: dict[str, Any] = field(default_factory=dict)
+    #: 自定义背景：纯色（#RRGGBB；空 = 使用默认渐变色）
+    bg_color: str = ""
+    #: 自定义背景图：PNG / GIF 路径（空 = 无图片）
+    bg_image: str = ""
     #: 联机：是否允许探听内网/回环服务器（默认关，避免把客户端变成 SSRF 跳板）
     allow_local_servers: bool = False
     #: 皮肤：是否启用 CSL 自动安装与上传入口
     skin_enabled: bool = True
     #: 皮肤模型：``auto`` 按图片判定 / ``classic`` / ``slim``
     skin_model: str = "auto"
+    #: 皮肤页布局：``v1`` 双栏卡片（默认） / ``v2`` 工作台 / ``v3`` 极简单栏
+    skin_layout: str = "v1"
     #: 账户提供者（本次仅 ``offline``；预留给外置登录）
     account_provider: str = "offline"
     #: 离线联机（P2P）：默认关闭，需显式开启（特权插件，走端到端加密隧道）
     p2p_enabled: bool = False
+    #: 虚拟局域网（Wintun 网卡 + UDP 直连/中继）：默认开，vpnd 未安装时自动回落旧隧道
+    p2p_vpn: bool = True
     #: 中继端口：0 = 由服务端下发（信令响应里携带）；非 0 仅作本地覆盖预留
     p2p_relay_port: int = 0
     #: 上次使用的房间名（仅标识；密码改由机器绑定加密存于插件存储）
@@ -89,12 +99,43 @@ class Config:
         self.width = max(320, int(self.width))
         self.height = max(240, int(self.height))
         self.download_base = (self.download_base or "").strip().rstrip("/")
+        raw_sources = (
+            self.download_sources
+            if isinstance(self.download_sources, (list, tuple))
+            else []
+        )
+        bases: list[str] = []
+        for item in raw_sources:
+            text = str(item or "").strip().rstrip("/")
+            if text and not text.startswith(("http://", "https://")):
+                continue
+            if text not in bases:
+                bases.append(text)
+        if bases:
+            self.download_sources = bases
+            # 首个非空源作为「主源」：皮肤/联机/看板等自有接口固定走它
+            self.download_base = next((item for item in bases if item), "")
+        else:
+            self.download_sources = [self.download_base] if self.download_base else []
         if self.skin_model not in ("auto", "classic", "slim"):
             self.skin_model = "auto"
+        if self.skin_layout not in ("v1", "v2", "v3"):
+            self.skin_layout = "v1"
         if not self.account_provider:
             self.account_provider = "offline"
         if not self.username:
             self.username = "Player"
+        # 背景：颜色只接受 #RRGGBB；图片必须真实存在，否则回退默认背景
+        color = (self.bg_color or "").strip()
+        if not (
+            len(color) == 7
+            and color.startswith("#")
+            and all(char in "0123456789abcdefABCDEF" for char in color[1:])
+        ):
+            color = ""
+        self.bg_color = color.upper()
+        image = (self.bg_image or "").strip()
+        self.bg_image = image if image and os.path.isfile(image) else ""
         self.p2p_relay_port = max(0, min(65535, int(self.p2p_relay_port)))
         self.p2p_last_room = (self.p2p_last_room or "").strip()[:64]
         # 设备标识：缺失/非法则生成一个稳定的 32 位 hex（首启落盘后不再变）

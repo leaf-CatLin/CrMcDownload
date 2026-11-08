@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
-from offcraft import DEFAULT_USER_AGENT
+from offcraft import DEFAULT_USER_AGENT, __version__
 from offcraft.net.proxy import ProxyConfig, open_tunnel, parse_proxy
 
 __all__ = [
@@ -26,6 +26,7 @@ __all__ = [
     "DownloadTask",
     "Downloader",
     "ProgressTracker",
+    "SourceStalled",
     "origin_of",
     "parse_origin",
     "sha1_file",
@@ -33,6 +34,17 @@ __all__ = [
 ]
 
 _CHUNK = 256 * 1024
+
+#: 单文件下载速率低于该值（字节/秒）即视为「过慢」
+SLOW_THRESHOLD = 256 * 1024
+#: 慢速判定的观察窗口（秒）
+SLOW_WINDOW = 6.0
+#: 开始慢速检测前的预热（秒）：避开建连与系统缓冲区填充
+SLOW_WARMUP = 4.0
+#: 剩余字节少于此值时不判慢（小文件很快下完，不值得切源）
+SLOW_MIN_BYTES = 8 * 1024 * 1024
+#: 单个文件最多因过慢切源次数
+STALL_SWITCHES = 2
 
 
 def origin_of(url: str) -> tuple[str, str, int] | None:
@@ -65,6 +77,10 @@ class DownloadError(RuntimeError):
 
 class Cancelled(RuntimeError):
     """用户取消。"""
+
+
+class SourceStalled(DownloadError):
+    """下载速率持续过低：保留 ``.part``，交给调用方换源后续传。"""
 
 
 def sha1_file(path: Path) -> str:
@@ -200,6 +216,12 @@ class Downloader:
         user_agent: str = DEFAULT_USER_AGENT,
         progress_callback: Callable[[ProgressTracker], None] | None = None,
         progress_interval: float = 0.2,
+        slow_threshold: float = SLOW_THRESHOLD,
+        slow_window: float = SLOW_WINDOW,
+        slow_warmup: float = SLOW_WARMUP,
+        slow_min_bytes: int = SLOW_MIN_BYTES,
+        stall_switches: int = STALL_SWITCHES,
+        url_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.proxy = parse_proxy(proxy) if isinstance(proxy, str) else proxy
         self.token = token or None
@@ -211,6 +233,13 @@ class Downloader:
         self.user_agent = user_agent
         self.progress_callback = progress_callback
         self.progress_interval = progress_interval
+        self.slow_threshold = max(0.0, float(slow_threshold))
+        self.slow_window = max(0.1, float(slow_window))
+        self.slow_warmup = max(0.0, float(slow_warmup))
+        self.slow_min_bytes = max(0, int(slow_min_bytes))
+        self.stall_switches = max(0, int(stall_switches))
+        #: 下载过慢时的换源回调：输入当前下载地址，返回新地址或 None
+        self.url_resolver = url_resolver
         self._ssl = ssl.create_default_context()
         self._last_progress = 0.0
         self._pool = threading.local()
@@ -234,6 +263,8 @@ class Downloader:
             "User-Agent": self.user_agent,
             "Accept": "*/*",
             "Accept-Encoding": "identity",
+            # 服务端据此判断客户端是否低于最低版本（旧版本会被 426 拒绝）
+            "X-OffCraft-Version": __version__,
         }
         # 令牌只能发给配置的镜像源：官方源、第三方 CDN、明文外链一律不带
         if self.sends_token(url):
@@ -284,6 +315,57 @@ class Downloader:
                 raise DownloadError(f"HTTP {resp.status}：{url}")
             resp.read(first_chunk)
             return time.monotonic() - started
+        except (OSError, http.client.HTTPException) as exc:
+            raise DownloadError(f"探测失败：{url}（{exc}）") from exc
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def probe_sample(
+        self, url: str, *, sample_bytes: int = 256 * 1024, timeout: float | None = None
+    ) -> dict[str, float | int | None]:
+        """探测「首字节耗时 + 下载速率」，不进入连接池。
+
+        只读取前 ``sample_bytes`` 字节（附带 ``Range`` 限制），返回
+        ``{"ttfb": 秒, "speed": 字节/秒, "bytes": 实读字节数}``。
+        服务端不支持 ``Range`` 时按整包首段处理；失败抛 :class:`DownloadError`。
+        """
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise DownloadError(f"非法 URL：{url}")
+        scheme = parts.scheme
+        host = parts.hostname
+        port = parts.port or (443 if scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        want = max(1, int(sample_bytes))
+        headers = self._headers(url, {"Range": f"bytes=0-{want - 1}"})
+        started = time.monotonic()
+        conn = self._new_connection(scheme, host, port, timeout)
+        first_at: float | None = None
+        received = 0
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            if resp.status not in (200, 206):
+                raise DownloadError(f"HTTP {resp.status}：{url}")
+            while received < want:
+                chunk = resp.read(min(16 * 1024, want - received))
+                if not chunk:
+                    break
+                if first_at is None:
+                    first_at = time.monotonic()
+                received += len(chunk)
+            ended = time.monotonic()
+            ttfb = None if first_at is None else first_at - started
+            elapsed = (ended - first_at) if first_at is not None else 0.0
+            speed = (received / elapsed) if elapsed > 0 and received else None
+            if ttfb is None:
+                raise DownloadError(f"空响应：{url}")
+            return {"ttfb": ttfb, "speed": speed, "bytes": received}
         except (OSError, http.client.HTTPException) as exc:
             raise DownloadError(f"探测失败：{url}（{exc}）") from exc
         finally:
@@ -445,8 +527,14 @@ class Downloader:
         task: DownloadTask,
         tracker: ProgressTracker | None = None,
         cancel: threading.Event | None = None,
+        *,
+        keep_part: bool = False,
     ) -> bool:
-        """下载单个文件；已存在且校验通过返回 ``False``（跳过）。"""
+        """下载单个文件；已存在且校验通过返回 ``False``（跳过）。
+
+        ``keep_part=True`` 时网络类失败会保留 ``.part``，下次从断点继续
+        （自更新安装包用得到；普通资源仍按原行为清理残片）。
+        """
         dest = Path(task.dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if verify_file(dest, task.sha1, task.size):
@@ -454,12 +542,22 @@ class Downloader:
         if tracker is not None:
             tracker.file_started(task.name)
         part = dest.with_name(dest.name + ".part")
+        url = task.url
         last_error: Exception | None = None
-        for attempt in range(self.retries + 1):
+        failures = 0
+        switches = 0
+        while True:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
             try:
-                written = self._download_attempt(task, part, tracker, cancel)
+                self._download_attempt(
+                    task,
+                    part,
+                    tracker,
+                    cancel,
+                    url=url,
+                    slow=switches < self.stall_switches,
+                )
                 if task.size is not None:
                     actual = part.stat().st_size
                     if actual != task.size:
@@ -467,17 +565,32 @@ class Downloader:
                 if task.sha1 and sha1_file(part).lower() != task.sha1.lower():
                     raise DownloadError("SHA-1 校验失败")
                 os.replace(part, dest)
-                if tracker is None and written:
-                    pass
                 return True
             except Cancelled:
                 raise
+            except SourceStalled as exc:
+                last_error = exc
+                # 保留 .part，询问调用方换源；没有更优源时关闭慢速检测继续下载
+                new_url = (
+                    self.url_resolver(url) if callable(self.url_resolver) else None
+                )
+                if new_url and new_url != url:
+                    switches += 1
+                    url = new_url
+                    continue
+                switches = self.stall_switches
+                continue
             except (OSError, http.client.HTTPException, DownloadError) as exc:
                 last_error = exc
-                if part.exists():
+                # 网络中断保留 .part 以便续传；校验/尺寸错误才丢弃，避免坏片被复用
+                if part.exists() and not (
+                    keep_part and isinstance(exc, (OSError, http.client.HTTPException))
+                ):
                     part.unlink(missing_ok=True)
-                if attempt < self.retries:
-                    time.sleep(min(2 ** attempt * 0.5, 4.0))
+                failures += 1
+                if failures > self.retries:
+                    break
+                time.sleep(min(2 ** (failures - 1) * 0.5, 4.0))
         raise DownloadError(f"下载失败：{task.name}（{last_error}）") from last_error
 
     def _download_attempt(
@@ -486,14 +599,21 @@ class Downloader:
         part: Path,
         tracker: ProgressTracker | None,
         cancel: threading.Event | None,
+        *,
+        url: str | None = None,
+        slow: bool = False,
     ) -> int:
+        target = url or task.url
         offset = part.stat().st_size if part.exists() else 0
         headers: dict[str, str] = {}
         if offset:
             headers["Range"] = f"bytes={offset}-"
-        conn, resp, key = self._request_with_retry(task.url, headers)
+        conn, resp, key = self._request_with_retry(target, headers)
         written = 0
         completed = False
+        started = time.monotonic()
+        window_start = started
+        window_bytes = 0
         try:
             if resp.status == 416:
                 part.unlink(missing_ok=True)
@@ -506,7 +626,7 @@ class Downloader:
                 offset = 0
                 expected = task.size
             else:
-                raise DownloadError(f"HTTP {resp.status}：{task.url}")
+                raise DownloadError(f"HTTP {resp.status}：{target}")
             if expected and task.size and expected != task.size:
                 raise DownloadError(f"服务端大小 {expected} 与预期 {task.size} 不符")
             # 直接写 .part：续传时前缀已在该文件中，不能再另起临时文件
@@ -519,9 +639,28 @@ class Downloader:
                         break
                     fh.write(chunk)
                     written += len(chunk)
+                    window_bytes += len(chunk)
                     if tracker is not None:
                         tracker.add_bytes(len(chunk))
                         self._emit_progress(tracker)
+                    if slow:
+                        now = time.monotonic()
+                        if (
+                            now - started >= self.slow_warmup
+                            and now - window_start >= self.slow_window
+                        ):
+                            rate = window_bytes / max(now - window_start, 1e-6)
+                            remaining = (
+                                None if task.size is None else task.size - offset - written
+                            )
+                            if (
+                                rate < self.slow_threshold
+                                and (remaining is None or remaining > self.slow_min_bytes)
+                            ):
+                                raise SourceStalled(
+                                    f"下载速率过低（{rate / 1024:.0f} KB/s），尝试切换下载源"
+                                )
+                            window_start, window_bytes = now, 0
             completed = True
             return written
         finally:

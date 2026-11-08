@@ -55,6 +55,21 @@ $buildDir = Join-Path $root 'build\installer'
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 $payload = Join-Path $buildDir 'payload.zip'
 
+# VPN components: rebuild on every package so vpnd.exe / vpn-setup.exe stay in sync
+# with the app sources, then copy them next to the main exe. PyInstaller 6 onedir
+# keeps auxiliary files under "_internal", so that is the real payload content dir.
+Write-Host '[0/4] building VPN components'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'vpn\vpn-build.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'vpn build failed' }
+$vpnOut = Join-Path $here 'vpn\out'
+$contentDir = Join-Path -Path $Dist -ChildPath '_internal'
+if (-not (Test-Path -Path $contentDir)) { $contentDir = $Dist }
+foreach ($name in @('vpnd.exe', 'vpn-setup.exe', 'wintun.dll', 'LICENSE.txt')) {
+    $src = Join-Path $vpnOut $name
+    if (-not (Test-Path $src)) { throw "missing $src (vpn-build.ps1 failed?)" }
+    Copy-Item $src (Join-Path $contentDir $name) -Force
+}
+
 Write-Host "[1/4] packing payload from $Dist"
 & python (Join-Path $here 'make_payload.py') $Dist $payload
 if ($LASTEXITCODE -ne 0) { throw 'payload build failed' }

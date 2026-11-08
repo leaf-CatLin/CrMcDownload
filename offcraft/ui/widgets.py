@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Callable
 
 from PyQt6.QtCore import QEvent, QObject, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -16,50 +18,92 @@ from PyQt6.QtWidgets import (
 )
 
 from offcraft.content.modrinth import ProjectHit
-from offcraft.ui.theme import ACCENT, MUTED, TEXT, human_count, initial_pixmap
+from offcraft.ui.theme import ACCENT, ACCENT_SOFT, MUTED, TEXT, human_count, initial_pixmap
 
 __all__ = ["Badge", "Card", "ComboPolisher", "ContentRow", "ElidedLabel", "Tile", "polish_combo"]
 
+#: 弹层专用样式：只作用在这个弹层窗口及其子控件，不影响其它列表
+_POPUP_QSS = f"""
+QFrame#comboPopup {{
+    background: #FFFFFF;
+    border: 0px;
+}}
+QAbstractItemView {{
+    background: #FFFFFF;
+    border: 0px;
+    border-radius: 0px;
+    padding: 4px;
+    outline: 0;
+    selection-background-color: {ACCENT_SOFT};
+    selection-color: {TEXT};
+}}
+QAbstractItemView::item {{
+    min-height: 26px;
+    padding: 2px 8px;
+    border-radius: 6px;
+}}
+QAbstractItemView::item:hover {{ background: #F2F6FE; }}
+"""
+
+
+def style_combo_popup(popup: QWidget, view: QAbstractItemView | None = None) -> None:
+    """把下拉弹层设成不透明白底、无边框，并让选中项用主题浅蓝。
+
+    弹层的黑边来自原生弹层窗口自身的边框/透明边距：这里给弹层整窗铺不透明白底，
+    不依赖窗口透明（透明在部分显卡/远程桌面下会被绘制成黑边）。
+    """
+    if view is None:
+        view = popup.findChild(QAbstractItemView)
+    popup.setObjectName("comboPopup")
+    popup.setStyleSheet(_POPUP_QSS)
+    popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+    popup.setContentsMargins(0, 0, 0, 0)
+    if not popup.isVisible():
+        # 弹层已显示时改窗口标志会让 Qt 重建窗口（等于把弹层关掉），只在空闲时设置
+        popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        popup.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
+    if view is not None:
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        view.setContentsMargins(0, 0, 0, 0)
+        palette = view.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT_SOFT))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(TEXT))
+        view.setPalette(palette)
+
 
 def polish_combo(combo: QComboBox) -> None:
-    """去掉下拉列表默认的黑色外框。
-
-    Qt 的 combo 弹出层是一个独立的 ``QComboBoxPrivateContainer`` 窗口：Windows 上它
-    自带 1px 原生边框（看起来就是一圈黑边），而且 ``WA_TranslucentBackground`` 必须
-    在原生窗口创建前设上才生效。所以顺序固定为：先设属性，再用 ``setWindowFlag``
-    强制重建一次原生窗口（重建时属性才会生效），最后换成无边框弹窗。
-    """
+    """去掉下拉列表默认的黑色外框（弹层窗口还没创建时什么也不做）。"""
     view = combo.view()
     if view is None:
         return
     try:
-        view.setFrameShape(QFrame.Shape.NoFrame)
-        view.setContentsMargins(0, 0, 0, 0)
         window = view.window()
         # 只在真拿到弹层窗口时动手：弹层未创建时 view.window() 会返回主窗口，
         # 盲目改它会把整个主窗口变成无边框。
         is_popup = window is not None and window is not view and window is not combo.window()
         if is_popup and (window.windowFlags() & Qt.WindowType.Popup):
-            window.setObjectName("comboPopup")
-            # 1) 先声明透明背景 2) 再改窗口标志（会重建原生窗口，属性随之生效）
-            window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-            window.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
-            window.setContentsMargins(0, 0, 0, 0)
+            style_combo_popup(window, view)
         combo.setMaxVisibleItems(14)
     except (AttributeError, RuntimeError):
         pass
 
 
 class ComboPolisher(QObject):
-    """全局事件过滤器：每个下拉框在首次绘制前都会被去掉黑边。"""
+    """全局事件过滤器：每个下拉弹层出现时都会去掉黑边。"""
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt 命名
-        if isinstance(obj, QComboBox) and event.type() in (
-            QEvent.Type.Polish,
-            QEvent.Type.Show,
-        ):
+        etype = event.type()
+        if isinstance(obj, QComboBox) and etype in (QEvent.Type.Polish, QEvent.Type.Show):
             polish_combo(obj)
+        elif etype == QEvent.Type.Show and isinstance(obj, QWidget) and (
+            obj.windowFlags() & Qt.WindowType.Popup
+        ):
+            # 懒加载页面里的下拉框在初始化时还拿不到弹层窗口，这里在弹层自己
+            # Show 时补一次样式（菜单等没有列表视图，findChild 会返回 None）
+            view = obj.findChild(QAbstractItemView)
+            if view is not None:
+                style_combo_popup(obj, view)
         return False
 
 
@@ -84,12 +128,12 @@ class Badge(QLabel):
     """圆角小标签。"""
 
     TONES = {
-        "blue": ("#E9F1FE", ACCENT),
-        "green": ("#E7F6EE", "#2E9E6B"),
-        "amber": ("#FDF3E3", "#B47616"),
-        "red": ("#FDECEA", "#C2453F"),
-        "gray": ("#F1F3F7", "#6C7688"),
-        "purple": ("#F2ECFD", "#7B5BD6"),
+        "blue": ("rgba(233, 241, 254, 0.72)", ACCENT),
+        "green": ("rgba(231, 246, 238, 0.72)", "#2E9E6B"),
+        "amber": ("rgba(253, 243, 227, 0.72)", "#B47616"),
+        "red": ("rgba(253, 236, 234, 0.72)", "#C2453F"),
+        "gray": ("rgba(241, 243, 247, 0.72)", "#6C7688"),
+        "purple": ("rgba(242, 236, 253, 0.72)", "#7B5BD6"),
     }
 
     def __init__(self, text: str = "", tone: str = "gray", parent: QWidget | None = None) -> None:

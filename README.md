@@ -38,6 +38,22 @@ Minecraft 启动器客户端：从自建镜像下载游戏版本、模组、整�
 - 设置页「测试连接」会清空缓存后重新探测，并追加每个路由的时延结论；
 - Modrinth 多个候选域名用 `SourceRouter.rank()` 按实测时延排序后取第一个。
 
+### 自动更新（0.7.0）
+
+设置页的「更新」卡片会请求镜像的 `/api/update`（未配下载源时回落 GitHub Releases API），
+拿到最新版本后按下面的顺序决定从哪下安装包（`offcraft/net/updater.py`）：
+
+1. **先测直连**：对 GitHub 安装包地址发 `Range: bytes=0-2047` 的 GET，读首字节耗时；
+2. **超过阈值（默认 1200 ms）就清 DNS**：Windows 走 `ipconfig /flushdns`（无窗口），
+   macOS / Linux 走对应的刷新命令，然后重测一次；
+3. **重测仍慢就用镜像**：改走 `{download_base}/github/<owner>/<repo>/releases/download/<tag>/<file>`，
+   由服务端代理 GitHub 资产；
+4. **断点续传**：安装包先写 `.part`，中断后再次下载会带 `Range` 续传（`Downloader.download(keep_part=True)`）。
+
+请求同时带 `X-OffCraft-Version`，服务端若返回 **426**（版本低于最低要求），
+界面会直接提示"客户端版本过低"并给出发布页 / 下载按钮，不会静默失败。
+选源结论（直连多少毫秒、是否清过 DNS、最终走哪条线）会写在任务面板详情里。
+
 ## 加载器与 Java
 
 | 加载器 | 安装方式 | 能否装模组 / 光影 |
@@ -80,9 +96,22 @@ Minecraft 启动器客户端：从自建镜像下载游戏版本、模组、整�
 - **自定义皮肤**：启动时自动为带加载器的实例安装 CSL（`offcraft/skins/csl.py`），并把皮肤源指向
   `{base}/skin/`；选图上传（`upload.py`）前用 Pillow 校验并自动判 `classic/slim`，上传走 token-origin 规则；
   `avatar.py` 从皮肤裁 8×8 头像替换启动页头像。未配下载源时皮肤入口置灰。
+- **默认皮肤与皮肤库（0.6.2+）**：`skins/default.py` 内置生成 64×64 默认皮肤，未上传时头像直接显示默认皮肤；
+  皮肤页可「使用默认 / 同步已上传 / 删除已上传」，并从镜像 `/api/skins/list` 浏览、双击预览他人皮肤；
+  classic/slim 切换会自动清掉旧贴图，避免继续命中旧模型。皮肤页提供三套原生布局：双栏卡片（默认）、
+  工作台、极简单栏，可在设置页「皮肤页样式」切换（`config.json` 的 `skin_layout`），
+  纯 PyQt 绘制棋盘格与圆角预览，设计草图见工作区 `design/skin-v1.html` ~ `v3.html`。
+- **每日一言（0.6.2+）**：启动页读取 `https://dlystc.unknownmp.top/api/v2/sentence` 的 JSON（失败回退
+  `/text?format=full`），按自然日缓存到 `<data>/daily/YYYY-MM-DD.json`，离线时显示内置文案
+  （`offcraft/daily.py`）。
+- **彩蛋（0.6.2+）**：设置-关于里的「千万别点」进入「点哪掉哪」模式：页面保持原样，鼠标点中哪个控件
+  才把哪个控件摘下掉落（按钮/文本/输入框，圆角白底，不含背景块），可拖动甩飞；单击已掉落的方块
+  会恢复页面并触发原控件，底部提示条也可点击恢复。没有 Esc/双击/静止自动恢复
+  （`offcraft/ui/physics.py` + `falling.py`）。
 - **外置登录预留**：`offcraft/account/` 定义 `AccountProvider` / `LaunchAccount` 与 `OfflineAccount`，启动命令
   支持 `-javaagent=` 注入；本次不实现账户服务，后续接 LittleSkin / authlib-injector 只需新增 provider。
-- 配置新增字段：`skin_enabled`（默认 true）、`skin_model`（`auto|classic|slim`）、`account_provider`（默认 `offline`）、
+- 配置新增字段：`skin_enabled`（默认 true）、`skin_model`（`auto|classic|slim`）、
+  `skin_layout`（`v1|v2|v3`，默认 `v1`）、`account_provider`（默认 `offline`）、
   `allow_local_servers`（默认 false）。
 
 ## 版本隔离
@@ -112,7 +141,7 @@ python main.py list       # CLI：list / install / check / instances / launch / 
 ## 测试与打包
 
 ```bash
-python -m unittest discover -s tests -v          # 单元测试
+python -m unittest discover -s tests -v          # 单元测试（323 项）
 python ../devtools/ui_smoke.py                   # 离屏界面自检（断言式）
 python ../devtools/ui_shots.py .testbed/shots    # 输出界面截图
 pyinstaller CrMCDownload.spec --noconfirm --clean

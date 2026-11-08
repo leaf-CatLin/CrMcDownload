@@ -34,6 +34,40 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(merged["memory_mb"], 8192)
         self.assertEqual(config.apply_version_overrides("1.21")["memory_mb"], 4096)
 
+    def test_skin_layout(self) -> None:
+        self.assertEqual(Config().skin_layout, "v1")
+        invalid = Config(skin_layout="v9")
+        invalid.normalize()
+        self.assertEqual(invalid.skin_layout, "v1")
+        with tempfile.TemporaryDirectory() as tmp:
+            save_config(Config(skin_layout="v3"), tmp)
+            self.assertEqual(load_config(tmp).skin_layout, "v3")
+
+    def test_download_sources_migrate(self) -> None:
+        # 旧配置只有 download_base：归一化时自动补成单源列表
+        legacy = Config(download_base="https://mc.example.com/")
+        legacy.normalize()
+        self.assertEqual(legacy.download_sources, ["https://mc.example.com"])
+
+    def test_download_sources_multi(self) -> None:
+        config = Config(
+            download_base="",
+            download_sources=["https://a.example.com/", "", "https://b.example.com"],
+        )
+        config.normalize()
+        self.assertEqual(
+            config.download_sources,
+            ["https://a.example.com", "", "https://b.example.com"],
+        )
+        # 首个非空源作为主源（皮肤/联机接口使用）
+        self.assertEqual(config.download_base, "https://a.example.com")
+
+    def test_download_sources_direct_only(self) -> None:
+        config = Config(download_sources=[""])
+        config.normalize()
+        self.assertEqual(config.download_sources, [""])
+        self.assertEqual(config.download_base, "")
+
 
 class InstancesTest(unittest.TestCase):
     def test_discover(self) -> None:

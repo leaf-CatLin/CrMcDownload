@@ -15,3 +15,7 @@ data/
 .vscode/
 Thumbs.db
 desktop.ini
+# VPN 组件构建产物（vpn-build.ps1 生成，打包时重建）
+packaging/vpn/out/
+packaging/vpn/bin/
+packaging/vpn/include/

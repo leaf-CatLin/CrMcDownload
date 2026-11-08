@@ -9,9 +9,10 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 from offcraft.mirror import DirectSource, Mirror
-from offcraft.net.latency import SourceRouter, make_source
+from offcraft.net.latency import SourceRouter, make_source, probe_source
 
 PAYLOAD = b"x" * 4096
 
@@ -124,6 +125,11 @@ class SourceRouterTest(unittest.TestCase):
         url = "https://example.invalid/some/file.bin"
         self.assertEqual(router.rewrite(url), url)
 
+    def test_api_url_delegates_to_mirror(self) -> None:
+        router = self.router(self.fast_base)
+        self.assertEqual(router.api_url("/skin/Player.png"), self.fast_base + "/skin/Player.png")
+        self.assertEqual(router.api_url("api/skins/list"), self.fast_base + "/api/skins/list")
+
     def test_disabled_router_never_probes(self) -> None:
         router = SourceRouter(Mirror(self.fast_base), enabled=False, samples=1)
         handler = self.fast.RequestHandlerClass
@@ -173,9 +179,142 @@ class SourceRouterTest(unittest.TestCase):
         self.assertFalse(prober.sends_token(self.slow_base + "/a.jar"))
 
 
+_RATE_PAYLOAD = b"r" * (256 * 1024)
+
+
+class _RateHandler(BaseHTTPRequestHandler):
+    """按块 + 间隔发送，用于区分「低延迟但出口窄」与「高速」的源。"""
+
+    chunk_delay = 0.0
+    chunk = 16 * 1024
+    hits = 0
+    lock = threading.Lock()
+
+    def log_message(self, *args):  # noqa: D401 - 静默
+        pass
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler 约定
+        cls = type(self)
+        with cls.lock:
+            cls.hits += 1
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(_RATE_PAYLOAD)))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        try:
+            for start in range(0, len(_RATE_PAYLOAD), self.chunk):
+                self.wfile.write(_RATE_PAYLOAD[start : start + self.chunk])
+                if cls.chunk_delay:
+                    time.sleep(cls.chunk_delay)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def _serve_rate(chunk_delay: float) -> tuple[ThreadingHTTPServer, str]:
+    handler = type(
+        "Handler",
+        (_RateHandler,),
+        {"chunk_delay": chunk_delay, "hits": 0, "lock": threading.Lock()},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+class MultiSourceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fast, cls.fast_base = _serve_rate(0.0)
+        cls.slow, cls.slow_base = _serve_rate(0.02)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for server in (cls.fast, cls.slow):
+            server.shutdown()
+            server.server_close()
+
+    def test_prefers_higher_throughput(self) -> None:
+        router = SourceRouter(
+            sources=[self.slow_base, self.fast_base],
+            samples=1,
+            timeout=3.0,
+            flush=False,
+        )
+        url = "https://libraries.minecraft.net/a.jar"
+        self.assertEqual(router.rewrite(url), self.fast_base + "/libs/a.jar")
+        decision = router.decisions()[0]
+        self.assertEqual(decision["mode"], "mirror")
+        self.assertIn("→", str(decision["detail"]))
+
+    def test_flush_dns_before_probe(self) -> None:
+        router = SourceRouter(
+            sources=[self.fast_base],
+            samples=1,
+            timeout=3.0,
+            ttl=0,
+            flush_cooldown=0,
+        )
+        with mock.patch("offcraft.net.latency.flush_dns", return_value=True) as flushed:
+            router.rewrite("https://libraries.minecraft.net/a.jar")
+            router.rewrite("https://libraries.minecraft.net/b.jar")
+        self.assertGreaterEqual(flushed.call_count, 2)
+
+    def test_rescan_switches_after_decision(self) -> None:
+        router = SourceRouter(
+            sources=[self.fast_base],
+            samples=1,
+            timeout=3.0,
+            flush=False,
+        )
+        url = "https://libraries.minecraft.net/a.jar"
+        chosen = router.rewrite(url)
+        # 没有更优源时 resolve_again 返回 None（下载器会关闭慢速检测继续下完）
+        self.assertIsNone(router.resolve_again(chosen))
+
+
+class ProbeSourceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server, cls.base = _serve(0.0)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_probe_source_reports_latency(self) -> None:
+        with mock.patch("offcraft.net.latency.flush_dns", return_value=True):
+            info = probe_source(self.base, timeout=3.0, sample_bytes=4096)
+        self.assertTrue(info["ok"], info.get("error"))
+        self.assertIsNotNone(info["latency"])
+        self.assertEqual(info["url"], self.base + "/meta/mc/game/version_manifest_v2.json")
+
+    def test_probe_dead_source_reports_error(self) -> None:
+        with mock.patch("offcraft.net.latency.flush_dns", return_value=True):
+            info = probe_source(_dead_url(), timeout=1.0, sample_bytes=4096)
+        self.assertFalse(info["ok"])
+
+
 class MakeSourceTest(unittest.TestCase):
     def test_empty_base_is_direct(self) -> None:
         self.assertIsInstance(make_source(""), DirectSource)
+
+    def test_multi_sources_build_router(self) -> None:
+        source = make_source(
+            sources=["https://a.example.com", "https://b.example.com"], enabled=True
+        )
+        self.assertIsInstance(source, SourceRouter)
+        self.assertEqual(source.bases, ["https://a.example.com", "https://b.example.com"])
+
+    def test_multi_sources_direct_only(self) -> None:
+        self.assertIsInstance(make_source(sources=[""]), DirectSource)
+
+    def test_multi_sources_disabled_uses_primary(self) -> None:
+        source = make_source(
+            sources=["https://b.example.com", "https://a.example.com"], enabled=False
+        )
+        self.assertIsInstance(source, Mirror)
+        self.assertEqual(source.base_url, "https://b.example.com")
 
     def test_invalid_base_is_direct(self) -> None:
         self.assertIsInstance(make_source("not-a-url"), DirectSource)

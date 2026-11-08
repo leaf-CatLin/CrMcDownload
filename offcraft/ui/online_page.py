@@ -216,10 +216,6 @@ class OnlinePage(QWidget):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(8)
 
-        title = QLabel("联机大厅")
-        title.setStyleSheet("font-size: 13pt; font-weight: 700;")
-        column.addWidget(title)
-
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索服务器地址 / 名称")
         self.search.returnPressed.connect(self.refresh)

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from offcraft.skins import upload as skin
+from offcraft.skins.default import default_skin_bytes
 from offcraft.skins.upload import SkinError, read_skin
 
 
@@ -43,6 +44,25 @@ class _FakeMirror:
 
     def api_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
+
+
+class _FakeDownloader:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.bytes_payload = _png((64, 64))
+        self.json_payload: dict = {}
+
+    def fetch_bytes(self, url, max_size=None, **kwargs):
+        self.calls.append(("GET", url))
+        return self.bytes_payload
+
+    def fetch_json(self, url, **kwargs):
+        self.calls.append(("GET", url))
+        return self.json_payload
+
+    def request_json(self, url, method="GET", **kwargs):
+        self.calls.append((method, url))
+        return self.json_payload
 
 
 class ValidateTests(unittest.TestCase):
@@ -119,6 +139,57 @@ class UploadTests(unittest.TestCase):
         # 上传只发给镜像 origin（download_base），不带第三方直连地址
         self.assertTrue(url.startswith("https://mirror.example/skin/Steve.png"))
         self.assertIn("model=classic", url)
+
+
+class DefaultSkinTests(unittest.TestCase):
+    def test_default_skin_is_valid_and_cached(self) -> None:
+        data = default_skin_bytes()
+        self.assertEqual(skin.validate_png(data), (64, 64))
+        self.assertLess(len(data), skin.MAX_SKIN_BYTES)
+        self.assertIs(data, default_skin_bytes())
+
+    def test_inspect_skin_matches_read_skin(self) -> None:
+        data = _png((64, 64), right_half_opaque=True)
+        info = skin.inspect_skin(data, "Steve")
+        self.assertEqual(info.model, "slim")
+        self.assertEqual(info.size, len(data))
+        self.assertEqual(info.filename, "Steve_slim.png")
+
+
+class OnlineSkinTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.downloader = _FakeDownloader()
+        self.mirror = _FakeMirror("https://mirror.example")
+
+    def test_fetch_uses_auto_model_and_fallback(self) -> None:
+        data = skin.fetch_skin("Steve", downloader=self.downloader, mirror=self.mirror)
+        self.assertEqual(data, self.downloader.bytes_payload)
+        _method, url = self.downloader.calls[-1]
+        self.assertTrue(url.endswith("/skin/Steve.png?model=auto&fallback=1"))
+
+    def test_delete_returns_removed_files(self) -> None:
+        self.downloader.json_payload = {"ok": True, "removed": ["Steve.png"]}
+        removed = skin.delete_skin("Steve", downloader=self.downloader, mirror=self.mirror)
+        self.assertEqual(removed, ["Steve.png"])
+        method, url = self.downloader.calls[-1]
+        self.assertEqual(method, "DELETE")
+        self.assertTrue(url.endswith("/skin/Steve.png"))
+
+    def test_list_skins_returns_items(self) -> None:
+        self.downloader.json_payload = {"items": [{"name": "Steve", "model": "classic"}]}
+        items = skin.list_skins(downloader=self.downloader, mirror=self.mirror, query="st")
+        self.assertEqual(items[0]["name"], "Steve")
+        _method, url = self.downloader.calls[-1]
+        self.assertIn("/api/skins/list?limit=100&q=st", url)
+
+    def test_remove_local_skin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(skin, "skin_cache_dir", lambda: Path(tmp)):
+                info = skin.SkinInfo(name="Steve", model="classic", width=64, height=64,
+                                     sha1="x", size=1)
+                skin.save_local_skin(info, _png((64, 64)))
+                self.assertTrue(skin.remove_local_skin("Steve"))
+                self.assertFalse(skin.remove_local_skin("Steve"))
 
 
 if __name__ == "__main__":

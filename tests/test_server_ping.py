@@ -39,7 +39,9 @@ def varint(value: int) -> bytes:
 
 
 def frame(payload: bytes) -> bytes:
-    return varint(len(payload)) + payload
+    """按真实 SLP 帧格式包装：帧长 + packetId(0x00) + 字符串长度 + payload。"""
+    inner = b"\x00" + varint(len(payload)) + payload
+    return varint(len(inner)) + inner
 
 
 class FakeServer:
@@ -71,10 +73,9 @@ class FakeServer:
             conn, _ = self._server.accept()
             with conn:
                 conn.settimeout(3)
-                while len(self.received) < 24:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
+                # 请求一次性发出（Handshake + 空的 Status Request），读一段即可
+                chunk = conn.recv(4096)
+                if chunk:
                     self.received.extend(chunk)
                 if self.payload is None:
                     return
@@ -164,6 +165,9 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(host, b"mc.example.com")
         self.assertEqual(port, (25565).to_bytes(2, "big"))
         self.assertEqual(next_state, 1)
+        # 状态请求必须是空包，不能把 Login Start（带玩家名）混进去
+        self.assertTrue(payload.endswith(b"\x01\x00"))
+        self.assertEqual(payload.count(b"OffCraft"), 0)
 
     def test_empty_and_close(self) -> None:
         with FakeServer(payload=None) as fake:

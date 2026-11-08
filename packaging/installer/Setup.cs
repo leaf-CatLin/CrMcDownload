@@ -180,6 +180,8 @@ namespace CrMcSetup
                 DeleteShortcuts();
                 Report(report, 40, "正在清理注册表…");
                 DeleteArp();
+                Report(report, 50, "正在卸载 VPN 组件…");
+                UninstallVpn();
                 Report(report, 60, "正在删除文件…");
                 if (!DeleteDirectory(TargetDir))
                 {
@@ -192,6 +194,41 @@ namespace CrMcSetup
  {
                 Fail(ex, interactive, "卸载失败");
                 return 1;
+            }
+        }
+
+        /// <summary>
+        /// 调用随包分发的 vpn-setup.exe 清理服务 / 虚拟网卡 / 防火墙规则。
+        /// 用户未启用过联机（未安装 VPN 组件）时静默跳过；拒绝 UAC 也不阻断主程序卸载。
+        /// </summary>
+        private static void UninstallVpn()
+        {
+            // PyInstaller 6 onedir 把非主程序文件放在 _internal，两处都要查
+            string setup = Path.Combine(TargetDir, "vpn-setup.exe");
+            if (!File.Exists(setup))
+            {
+                setup = Path.Combine(TargetDir, "_internal", "vpn-setup.exe");
+            }
+            if (!File.Exists(setup))
+            {
+                return;
+            }
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(setup, "/uninstall");
+                psi.UseShellExecute = true;      // runas 需要 ShellExecute
+                psi.Verb = "runas";
+                psi.WorkingDirectory = TargetDir;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                Process process = Process.Start(psi);
+                if (process != null)
+                {
+                    process.WaitForExit(15000);
+                }
+            }
+            catch (Exception)
+            {
+                // 拒绝提权 / 服务未安装：继续删除安装目录即可
             }
         }
 

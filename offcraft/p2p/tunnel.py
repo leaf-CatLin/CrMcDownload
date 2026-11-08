@@ -164,17 +164,42 @@ class HostTunnel:
         self._cancel = cancel or threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self.run, name="p2p-host-tunnel", daemon=True)
+    def start(self, on_event: Callable[[str], None] | None = None) -> None:
+        self._thread = threading.Thread(
+            target=self.run, args=(on_event,), name="p2p-host-tunnel", daemon=True
+        )
         self._thread.start()
 
     def run(self, on_event: Callable[[str], None] | None = None) -> None:
+        """轮询 announce；``on_event('expired'|'error'|'ok')`` 只在状态变化时回调一次。
+
+        房间被删除/过期（HTTP 404）时停止轮询，交给面板提示用户重新开放，避免空转。
+        """
+        state: str | None = None
+
+        def report(status: str) -> None:
+            nonlocal state
+            if status != state:
+                state = status
+                if on_event is not None:
+                    try:
+                        on_event(status)
+                    except Exception:  # noqa: BLE001 - 回调异常不影响轮询
+                        pass
+
         while not self._cancel.is_set():
             try:
                 resp = self._room.announce(world=self._room.world, port=self._mc_port)
-            except Exception:  # noqa: BLE001 - 轮询失败下一轮重试
+            except Exception as exc:  # noqa: BLE001 - 分类后决定重试或退出
+                text = str(exc)
+                if "HTTP 404" in text:
+                    report("expired")
+                    self._cancel.set()
+                    return
+                report("error")
                 self._cancel.wait(self._interval)
                 continue
+            report("ok")
             token = str(resp.get("relay_token") or "")
             if token:
                 threading.Thread(target=self._serve, args=(token,),

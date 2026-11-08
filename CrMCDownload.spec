@@ -1,7 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller 打包配置：文件夹分发（onedir），避免单文件运行时解压临时目录失败。"""
 
+import os
+
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+
+# 虚拟局域网数据面（packaging/vpn/out，由 packaging/vpn/vpn-build.ps1 产出）：
+# vpnd.exe / vpn-setup.exe / wintun.dll 必须和主程序同目录，GUI 才能在首次启用时提权安装。
+_vpn_out = os.path.join(SPECPATH, "packaging", "vpn", "out")
+_vpn_binaries = []
+for _name in ("vpnd.exe", "vpn-setup.exe", "wintun.dll"):
+    _path = os.path.join(_vpn_out, _name)
+    if os.path.isfile(_path):
+        _vpn_binaries.append((_path, "."))
+_vpn_datas = []
+_license = os.path.join(_vpn_out, "LICENSE.txt")
+if os.path.isfile(_license):
+    _vpn_datas.append((_license, "."))
 
 # 皮肤校验 / 头像裁切用到 Pillow，onedir 产物必须显式收齐 PIL 子模块与 _imaging 扩展；
 # 官方内置插件经 importlib 动态导入，静态分析抓不到，须一并收集 offcraft.plugins.builtin；
@@ -10,12 +25,13 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=collect_dynamic_libs("nacl"),
-    datas=[("assets/icon.ico", "assets")],
+    binaries=collect_dynamic_libs("nacl") + _vpn_binaries,
+    datas=[("assets/icon.ico", "assets"), ("assets/icon.png", "assets"), *_vpn_datas],
     hiddenimports=[
         "PyQt6.QtCore",
         "PyQt6.QtGui",
         "PyQt6.QtWidgets",
+        "PyQt6.QtSvg",
         *collect_submodules("PIL"),
         *collect_submodules("offcraft.plugins.builtin"),
         *collect_submodules("nacl"),

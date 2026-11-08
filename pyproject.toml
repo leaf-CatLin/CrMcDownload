@@ -1,6 +1,6 @@
 [project]
 name = "offcraft"
-version = "0.6.2"
+version = "0.8.0"
 description = "CrMcDownload - Minecraft launcher client (download, install, offline launch)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

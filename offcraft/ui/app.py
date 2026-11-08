@@ -25,12 +25,21 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
-from PyQt6.QtCore import QPoint, QSize, Qt, QTimer
-from PyQt6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -51,6 +60,7 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -59,7 +69,9 @@ from PyQt6.QtWidgets import (
 
 from offcraft import APP_NAME, __version__
 from offcraft.config import Config, config_dir, save_config
+from offcraft.net import updater as update_client
 from offcraft.content.install import download_file, install_project_version, safe_filename
+from offcraft.daily import FALLBACK, load_cached, today_sentence
 from offcraft.content.java import (
     JavaRuntime,
     install_java_runtime,
@@ -95,14 +107,24 @@ from offcraft.launch.process import GameProcess
 from offcraft.meta.manifest import VersionManifest, VersionSummary
 from offcraft.meta.version import load_version
 from offcraft.net.downloader import Downloader, ProgressTracker
-from offcraft.net.latency import make_source
+from offcraft.net.latency import make_source, probe_source
 from offcraft.plugins.registry import PluginRegistry
+from offcraft.skins.avatar import head_avatar
+from offcraft.skins.default import default_skin_bytes
 from offcraft.ui.content_page import ContentPage
+from offcraft.ui.chrome import TitleBar, enable_native_chrome, native_hit_test
+from offcraft.ui.backdrop import Backdrop
+from offcraft.ui.falling import FallingOverlay
+from offcraft.ui.icons import icon_pixmap
 from offcraft.ui.install_page import InstallPage
+from offcraft.ui.spinner import Spinner
+from offcraft.ui.style import LineStyle
 from offcraft.ui.online_page import OnlinePage
-from offcraft.ui.skin_page import SkinPage
+from offcraft.ui.skin_page import LAYOUT_CHOICES, SkinPage
 from offcraft.ui.theme import (
+    ACCENT,
     DANGER,
+    MUTED,
     OK,
     app_qss,
     block_pixmap,
@@ -131,6 +153,15 @@ NAV_ITEMS = [
     ("plugins", "插件"),
 ]
 
+#: 导航图标（SVG 线条图标名）
+NAV_ICONS = {
+    "home": "home",
+    "online": "globe",
+    "download": "download",
+    "settings": "settings",
+    "plugins": "blocks",
+}
+
 #: 草图单位长度：1k = 16px（窗口 75k × 50k → 1200 × 800）
 UNIT_PX = 16
 
@@ -157,6 +188,16 @@ AVATAR_PX = 128
 
 #: 下载中心全部页签（游戏版本 + 内容 + Java）
 DOWNLOAD_TABS = [("game", "游戏版本")] + CONTENT_TABS + [("java", "Java")]
+
+#: 下载页左侧分类图标
+DOWNLOAD_TAB_ICONS = {
+    "game": "cube",
+    "mod": "package",
+    "modpack": "layers",
+    "resourcepack": "image",
+    "shader": "sun",
+    "java": "cup",
+}
 
 #: 插件页分区（仅框架）
 PLUGIN_TABS = [
@@ -207,40 +248,85 @@ def _reveal(folder: Path | str) -> None:
         pass
 
 
+def _rate_text(speed: float | None) -> str:
+    """把字节/秒格式化成界面友好的一小段文字。"""
+    if not speed or speed <= 0:
+        return "—"
+    if speed >= 1024 * 1024:
+        return f"{speed / (1024 * 1024):.1f} MB/s"
+    return f"{speed / 1024:.0f} KB/s"
+
+
 class SourceDialog(QDialog):
-    """下载源设置（仅 F12 可打开，界面上不展示具体地址）。"""
+    """下载源设置（仅 F12 可打开）：支持多源、测延迟与速率、智能择优。"""
+
+    probed = pyqtSignal(object)
 
     def __init__(self, parent: QWidget, config: Config) -> None:
         super().__init__(parent)
         self.config = config
+        self._rows: list[QWidget] = []
+        self._edits: dict[QWidget, QLineEdit] = {}
+        self._labels: dict[QWidget, QLabel] = {}
+        self._closing = False
+        self.probed.connect(self._apply_results)
         self.setWindowTitle("下载源设置")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(640)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(10)
-        hint = QLabel("客户端只与下载源通信：游戏文件、Fabric、Modrinth 都会经由该地址代理。")
+        hint = QLabel(
+            "支持多个下载源：先测各源的延迟与下载速度，自动选择更快的源；下载过慢时会重新探测并切换。"
+            "首个非空源同时用于皮肤/联机等自有接口，留空表示官方直连。"
+        )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self.base = QLineEdit(config.download_base or "https://mc.yjlt.top")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(200)
+        host = QWidget()
+        self._rows_layout = QVBoxLayout(host)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setSpacing(6)
+        self._rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(host)
+        layout.addWidget(scroll)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(10)
+        add = QPushButton("添加源")
+        add.clicked.connect(lambda: self._add_row(""))
+        self.test_btn = QPushButton("测试全部源")
+        self.test_btn.clicked.connect(self._probe_all)
+        tools.addWidget(add)
+        tools.addWidget(self.test_btn)
+        tools.addStretch(1)
+        layout.addLayout(tools)
+
+        bases = list(getattr(config, "download_sources", None) or [])
+        if not bases:
+            bases = [config.download_base]
+        for base in bases:
+            self._add_row(base)
+
         self.token = QLineEdit(config.download_token)
         self.proxy = QLineEdit(config.proxy)
         self.workers = QSpinBox()
         self.workers.setRange(1, 16)
         self.workers.setValue(int(config.max_workers))
-        for label, widget in (
-            ("下载源", self.base),
+        for name, widget in (
             ("访问令牌", self.token),
             ("代理", self.proxy),
             ("并发下载数", self.workers),
         ):
             row = QHBoxLayout()
             row.setSpacing(10)
-            name = QLabel(label)
-            name.setObjectName("muted")
-            name.setFixedWidth(76)
-            row.addWidget(name)
+            label = QLabel(name)
+            label.setObjectName("muted")
+            label.setFixedWidth(76)
+            row.addWidget(label)
             row.addWidget(widget, 1)
             layout.addLayout(row)
 
@@ -255,8 +341,111 @@ class SourceDialog(QDialog):
         buttons.addWidget(ok)
         layout.addLayout(buttons)
 
+    # ------------------------------------------------------------- 源列表
+    def _add_row(self, text: str = "") -> None:
+        row = QFrame()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        edit = QLineEdit(str(text or ""))
+        edit.setPlaceholderText("https://…（留空 = 官方直连）")
+        label = QLabel("未测试")
+        label.setObjectName("muted")
+        label.setFixedWidth(200)
+        remove = QPushButton("删除")
+        remove.setFixedWidth(56)
+        remove.clicked.connect(lambda _=False, widget=row: self._remove_row(widget))
+        layout.addWidget(edit, 1)
+        layout.addWidget(label)
+        layout.addWidget(remove)
+        self._rows.append(row)
+        self._edits[row] = edit
+        self._labels[row] = label
+        self._rows_layout.addWidget(row)
+
+    def _remove_row(self, row: QWidget) -> None:
+        if len(self._rows) <= 1:
+            # 至少保留一行：清空即表示官方直连
+            self._edits[row].clear()
+            self._labels[row].setText("未测试")
+            return
+        self._rows.remove(row)
+        self._edits.pop(row, None)
+        self._labels.pop(row, None)
+        row.setParent(None)
+        row.deleteLater()
+
+    def _row_base(self, row: QWidget) -> str:
+        """读取一行的源地址；允许省略协议（默认 https）。"""
+        text = self._edits[row].text().strip().rstrip("/")
+        if text and "://" not in text:
+            text = "https://" + text
+        return text
+
+    # ------------------------------------------------------------- 测试
+    def _probe_all(self) -> None:
+        self.test_btn.setEnabled(False)
+        for label in self._labels.values():
+            label.setText("测试中…")
+        proxy = self.proxy.text().strip()
+        token = self.token.text().strip()
+        targets = [(row, self._row_base(row)) for row in self._rows]
+
+        def worker() -> None:
+            results: list[tuple[QWidget, dict[str, object]]] = []
+            for row, base in targets:
+                try:
+                    info = probe_source(base, proxy=proxy, token=token, timeout=5.0)
+                except Exception as exc:  # noqa: BLE001 - 把失败原因展示给用户
+                    info = {"base": base, "ok": False, "error": str(exc)}
+                results.append((row, info))
+            if not self._closing:
+                self.probed.emit(results)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_results(self, results: object) -> None:
+        rows = list(results or [])
+        best_row: QWidget | None = None
+        best_score: float | None = None
+        for row, info in rows:
+            label = self._labels.get(row)
+            if label is None:
+                continue
+            if not info.get("ok"):
+                label.setText("不可达")
+                continue
+            latency = float(info.get("latency") or 0.0)
+            speed = info.get("speed")
+            rate = float(speed) if speed else None
+            score = latency + (1048576 / rate if rate else 0.0)
+            if best_score is None or score < best_score:
+                best_score, best_row = score, row
+            text = f"{latency * 1000:.0f}ms · {_rate_text(rate)}"
+            label.setText(text)
+        if best_row is not None:
+            label = self._labels.get(best_row)
+            if label is not None:
+                label.setText("★ " + label.text())
+        self.test_btn.setEnabled(True)
+
+    # ------------------------------------------------------------- 保存
+    def accept(self) -> None:
+        self._closing = True
+        super().accept()
+
+    def reject(self) -> None:
+        self._closing = True
+        super().reject()
+
     def apply(self) -> None:
-        self.config.download_base = self.base.text().strip().rstrip("/") or "https://mc.yjlt.top"
+        bases: list[str] = []
+        for row in self._rows:
+            text = self._row_base(row)
+            if text not in bases:
+                bases.append(text)
+        self.config.download_sources = bases
+        self.config.download_base = next((item for item in bases if item), "")
         self.config.download_token = self.token.text().strip()
         self.config.proxy = self.proxy.text().strip()
         self.config.max_workers = int(self.workers.value())
@@ -558,6 +747,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.data_dir = data_dir
+        app = QApplication.instance()
+        if app is not None and not isinstance(app.style(), LineStyle):
+            app.setStyle(LineStyle(app.style()))
         # Java 探测磁盘缓存预热：避免每次启动都遍历安装目录 + spawn java -version
         prime_java_cache(getattr(config, "java_cache", None))
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -574,10 +766,10 @@ class MainWindow(QMainWindow):
         self._icon_waiters: dict[str, list[tuple[Callable[[QPixmap], None], int]]] = {}
         self._icon_loading: set[str] = set()
         self._content_client: ModrinthClient | None = None
-        self._content_key: tuple[str, str, str] | None = None
+        self._content_key: tuple[Any, ...] | None = None
         self._version_rows: list[VersionSummary] = []
-        #: 下载源缓存（按 base/proxy/择优开关 区分），保留探测结论避免重复测时
-        self._sources: dict[str, Any] = {}
+        #: 下载源缓存（按源列表/代理/择优开关区分），保留探测结论避免重复测时
+        self._sources: dict[tuple[Any, ...], Any] = {}
         #: 官方内置插件注册表：host 适配器把宿主原语受限地递给插件
         self._plugin_nav_items: list[tuple[str, str, Callable[[], Any]]] = []
         self.plugin_registry = PluginRegistry(self.data_dir, host=_PluginHost(self))
@@ -585,8 +777,11 @@ class MainWindow(QMainWindow):
         #: 离线联机「进入」面板（插件页卡片打开时持有，退出时清理会话）
         self._offline_panel: Any = None
 
+        # 无边框窗口：标题栏、窗口按钮、阴影与缩放全部由应用自己绘制
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(QIcon(block_pixmap("crmcdownload", 64)))
+        self._window_icon = QIcon(block_pixmap("crmcdownload", 64))
+        self.setWindowIcon(self._window_icon)
         self.setStyleSheet(app_qss())
         self.setMinimumSize(*WINDOW_MIN)
         width = int((config.window or {}).get("w", WINDOW_DEFAULT[0]) or WINDOW_DEFAULT[0])
@@ -604,6 +799,8 @@ class MainWindow(QMainWindow):
         self.resize(width, height)
 
         self._build()
+        # 自定义背景：颜色 / PNG / GIF（设置页可随时修改）
+        self.apply_background()
         # 所有下拉框统一去黑边（不依赖事件过滤器时序：弹层是独立顶层窗口）
         self.polish_combos()
         QShortcut(QKeySequence("F12"), self, activated=self.open_source_dialog)
@@ -616,10 +813,37 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._drain)
         self._timer.start(80)
 
+        #: 下载页内容静默刷新（每 100 秒重新拉取一次，不打断当前浏览）
+        self._content_timer = QTimer(self)
+        self._content_timer.setInterval(100_000)
+        self._content_timer.timeout.connect(self._refresh_download_content)
+
+        #: 系统托盘与「关闭到托盘」状态
+        self.tray: QSystemTrayIcon | None = None
+        self._force_quit = False
+        self._tray_notice_shown = False
+        self._build_tray()
+        if self.tray is not None:
+            app = QApplication.instance()
+            if app is not None:
+                # 关闭窗口只是隐藏到托盘，真正的退出由托盘菜单触发
+                app.setQuitOnLastWindowClosed(False)
+
     def polish_combos(self) -> None:
         """建完界面后把每个下拉框的弹层都设成无边框透明窗口。"""
         for combo in self.findChildren(QComboBox):
             polish_combo(combo)
+
+    # ------------------------------------------------------------- 自定义背景
+    def apply_background(self) -> None:
+        """把配置里的背景色 / 背景图同步到最底层背景层。"""
+        backdrop = getattr(self, "backdrop", None)
+        if backdrop is None:
+            return
+        backdrop.set_appearance(
+            getattr(self.config, "bg_color", ""),
+            getattr(self.config, "bg_image", ""),
+        )
 
     # ------------------------------------------------------------- 布局
     def _label(self, text: str, name: str = "muted") -> QLabel:
@@ -631,11 +855,13 @@ class MainWindow(QMainWindow):
     def _hline() -> QFrame:
         line = QFrame()
         line.setFixedHeight(1)
-        line.setStyleSheet("background: #E9EEF6; border: none;")
+        line.setStyleSheet("background: rgba(233, 238, 246, 0.80); border: none;")
         return line
 
     def _build(self) -> None:
-        central = QWidget()
+        # 背景层同时作为 central widget：渐变/图片/GIF 画在最底层，界面控件叠在上面
+        central = Backdrop()
+        self.backdrop = central
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
@@ -675,12 +901,11 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_topbar(self) -> QWidget:
-        """顶部菜单栏（5k）：logo 在左，四项导航居中，右侧显示当前状态。"""
-        bar = QFrame()
-        bar.setObjectName("topbar")
+        """顶部菜单栏（5k）：logo 在左，四项导航居中，右侧显示状态与窗口按钮。"""
+        bar = TitleBar(self)
         bar.setFixedHeight(TOPBAR_H)
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(u(1.5), 0, u(1.5), 0)
+        layout.setContentsMargins(u(1.5), 0, u(0.75), 0)
         layout.setSpacing(u(0.75))
 
         side = u(14)
@@ -713,6 +938,10 @@ class MainWindow(QMainWindow):
             button.setMinimumHeight(40)
             button.setMinimumWidth(u(6))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._set_nav_icon(button, key, False)
+            button.toggled.connect(
+                lambda checked, b=button, k=key: self._set_nav_icon(b, k, checked)
+            )
             button.clicked.connect(lambda _c, page=key: self.show_page(page))
             group.addButton(button)
             nav_row.addWidget(button)
@@ -721,7 +950,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
 
         status = QWidget()
-        status.setFixedWidth(side)
+        status.setFixedWidth(u(11))
         status_row = QHBoxLayout(status)
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(u(0.375))
@@ -735,7 +964,170 @@ class MainWindow(QMainWindow):
         )
         status_row.addWidget(self.status_label, 1)
         layout.addWidget(status)
+        layout.addWidget(self._build_window_controls())
+        self._sync_window_controls()
         return bar
+
+    def _set_nav_icon(self, button: QPushButton, key: str, active: bool) -> None:
+        """导航图标随选中状态在灰/强调蓝之间切换。"""
+        color = ACCENT if active else "#4B5565"
+        button.setIcon(QIcon(icon_pixmap(NAV_ICONS.get(key, "blocks"), 18, color)))
+        button.setIconSize(QSize(18, 18))
+
+    def _set_tab_icon(self, button: QPushButton, key: str, active: bool) -> None:
+        """下载页分类图标随选中状态着色。"""
+        color = ACCENT if active else "#6B7688"
+        button.setIcon(QIcon(icon_pixmap(DOWNLOAD_TAB_ICONS.get(key, "blocks"), 18, color)))
+        button.setIconSize(QSize(18, 18))
+
+    def _build_window_controls(self) -> QWidget:
+        """标题栏右侧的最小化 / 最大化 / 关闭按钮。"""
+        wrap = QWidget()
+        wrap.setFixedWidth(u(7))
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(u(0.25))
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.win_min = QPushButton()
+        self.win_min.setObjectName("winBtn")
+        self.win_min.setFixedSize(32, 30)
+        self.win_min.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_min.setToolTip("最小化")
+        self.win_min.clicked.connect(self.showMinimized)
+
+        self.win_max = QPushButton()
+        self.win_max.setObjectName("winBtn")
+        self.win_max.setFixedSize(32, 30)
+        self.win_max.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_max.clicked.connect(self._toggle_maximize)
+
+        self.win_close = QPushButton()
+        self.win_close.setObjectName("winClose")
+        self.win_close.setFixedSize(32, 30)
+        self.win_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_close.setToolTip("关闭（可关闭到系统托盘）")
+        self.win_close.clicked.connect(self.close)
+
+        for button in (self.win_min, self.win_max, self.win_close):
+            row.addWidget(button)
+        return wrap
+
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _sync_window_controls(self) -> None:
+        """按当前窗口状态切换最大化/还原图标。"""
+        if not hasattr(self, "win_max"):
+            return
+        name = "restore" if self.isMaximized() else "maximize"
+        self.win_max.setIcon(QIcon(icon_pixmap(name, 16, "#5B6678")))
+        self.win_max.setIconSize(QSize(16, 16))
+        self.win_max.setToolTip("还原" if self.isMaximized() else "最大化")
+        self.win_min.setIcon(QIcon(icon_pixmap("minimize", 16, "#5B6678")))
+        self.win_min.setIconSize(QSize(16, 16))
+        self.win_close.setIcon(QIcon(icon_pixmap("close", 16, "#5B6678")))
+        self.win_close.setIconSize(QSize(16, 16))
+
+    # ------------------------------------------------------------- 窗口外壳
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().showEvent(event)
+        if not getattr(self, "_chrome_ready", False):
+            self._chrome_ready = True
+            enable_native_chrome(self)
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_window_controls()
+
+    def nativeEvent(self, event_type, message):  # noqa: N802 - Qt 命名
+        """接管 Windows 的 WM_NCHITTEST，让无边框窗口保留原生缩放热区。"""
+        code = native_hit_test(self, message)
+        if code is not None:
+            return True, code
+        # 不转交 super()：基类实现返回的 sip 对象在部分 PyQt 版本会触发访问冲突
+        return False, 0
+
+    # ------------------------------------------------------------- 系统托盘
+    def _build_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(self._tray_icon(), self)
+        tray.setToolTip(f"{APP_NAME} {__version__}")
+        menu = QMenu(self)
+        action_show = menu.addAction(QIcon(icon_pixmap("home", 16)), "显示主界面")
+        action_show.triggered.connect(self._restore_from_tray)
+        action_download = menu.addAction(QIcon(icon_pixmap("download", 16)), "下载中心")
+        action_download.triggered.connect(self._open_download_from_tray)
+        action_launch = menu.addAction(QIcon(icon_pixmap("play", 16)), "启动游戏")
+        action_launch.triggered.connect(self._launch_or_stop)
+        menu.addSeparator()
+        action_quit = menu.addAction(QIcon(icon_pixmap("close", 16)), "退出")
+        action_quit.triggered.connect(self._quit_from_tray)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self.tray = tray
+
+    def _tray_icon(self) -> QIcon:
+        """优先使用打包内置的品牌图标，缺失时回退到程序化方块图标。"""
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        for name in ("icon.png", "icon.ico"):
+            path = base / "assets" / name
+            if path.is_file():
+                return QIcon(str(path))
+        return self._window_icon
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _open_download_from_tray(self) -> None:
+        self._restore_from_tray()
+        self.goto_tab("mod")
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
+        if self.tray is not None:
+            self.tray.hide()
+        if self.close():
+            QApplication.quit()
+
+    # ------------------------------------------------------------- 下载页联动
+    def _sync_content_timer(self, name: str) -> None:
+        timer = getattr(self, "_content_timer", None)
+        if timer is None:
+            return
+        if name == "download":
+            if not timer.isActive():
+                timer.start()
+        else:
+            timer.stop()
+
+    def _refresh_download_content(self) -> None:
+        """下载页内容每 100 秒静默拉取一次；窗口隐藏到托盘时暂停。"""
+        if not self.isVisible():
+            return
+        page = self.pages.get("download")
+        if page is None or self.stack.currentWidget() is not page:
+            return
+        if self._current_tab in ("game", "java"):
+            return
+        content = getattr(self, "content_pages", {}).get(self._current_tab)
+        if content is not None:
+            content.live_refresh()
 
     def _build_home_page(self) -> QWidget:
         """启动页：左 20k（头像 / 名称 / 启动），右 55k（版本条 / 模组存档 / 配置）。"""
@@ -754,7 +1146,7 @@ class MainWindow(QMainWindow):
 
         self.avatar = QLabel()
         self.avatar.setFixedSize(AVATAR_PX, AVATAR_PX)
-        self.avatar.setPixmap(initial_pixmap(self.config.username, AVATAR_PX, "account"))
+        self.avatar.setPixmap(self._avatar_pixmap(self.config.username, AVATAR_PX))
         avatar_row = QHBoxLayout()
         avatar_row.setContentsMargins(0, 0, 0, 0)
         avatar_row.addStretch(1)
@@ -775,6 +1167,26 @@ class MainWindow(QMainWindow):
         self.account_name.editingFinished.connect(self._apply_account_name)
         panel.add(self.account_name)
 
+        daily = QFrame()
+        daily.setObjectName("dailyCard")
+        daily.setStyleSheet(
+            "QFrame#dailyCard { background: rgba(247, 249, 253, 0.58);"
+            " border: 1px solid rgba(227, 233, 242, 0.80);"
+            " border-radius: 10px; }"
+        )
+        daily_layout = QVBoxLayout(daily)
+        daily_layout.setContentsMargins(10, 7, 10, 8)
+        daily_layout.setSpacing(3)
+        daily_head = QLabel("每日一言")
+        daily_head.setStyleSheet(f"color: {MUTED}; font-size: 8pt; font-weight: 600;")
+        daily_layout.addWidget(daily_head)
+        self.daily_label = QLabel(FALLBACK.display)
+        self.daily_label.setWordWrap(True)
+        self.daily_label.setMaximumHeight(60)
+        self.daily_label.setStyleSheet(f"color: {MUTED}; font-size: 8.6pt;")
+        daily_layout.addWidget(self.daily_label)
+        panel.add(daily)
+
         panel.body.addStretch(1)
         self.home_hint = self._label("", "muted")
         self.home_hint.setWordWrap(True)
@@ -786,6 +1198,8 @@ class MainWindow(QMainWindow):
         self.launch_button.setObjectName("accentBig")
         self.launch_button.setFixedHeight(u(3.5))
         self.launch_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.launch_button.setIcon(QIcon(icon_pixmap("play", 20, "#FFFFFF")))
+        self.launch_button.setIconSize(QSize(20, 20))
         self.launch_button.clicked.connect(self._launch_or_stop)
         panel.add(self.launch_button)
 
@@ -796,6 +1210,8 @@ class MainWindow(QMainWindow):
         skin_button.setObjectName("skinEntry")
         skin_button.setFixedHeight(u(2.25))
         skin_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        skin_button.setIcon(QIcon(icon_pixmap("person", 15, ACCENT)))
+        skin_button.setIconSize(QSize(15, 15))
         skin_button.setToolTip("上传自定义皮肤（需镜像支持 /skin）")
         skin_button.clicked.connect(self.open_skin_page)
         panel.add(skin_button)
@@ -805,11 +1221,15 @@ class MainWindow(QMainWindow):
         instance_button = QPushButton("版本设置")
         instance_button.setFixedHeight(u(2.25))
         instance_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        instance_button.setIcon(QIcon(icon_pixmap("settings", 15, "#5B6678")))
+        instance_button.setIconSize(QSize(15, 15))
         instance_button.clicked.connect(self._open_instance_dialog)
         actions.addWidget(instance_button, 1)
         open_button = QPushButton("打开目录")
         open_button.setFixedHeight(u(2.25))
         open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_button.setIcon(QIcon(icon_pixmap("folder", 15, "#5B6678")))
+        open_button.setIconSize(QSize(15, 15))
         open_button.clicked.connect(self._open_game_dir)
         actions.addWidget(open_button, 1)
         panel.add_layout(actions)
@@ -826,7 +1246,31 @@ class MainWindow(QMainWindow):
         right_column.addWidget(self._build_home_middle(), 25)
         right_column.addWidget(self._build_home_config(), 15)
         layout.addWidget(right, 1)
+        self._load_daily_sentence()
         return page
+
+    def _load_daily_sentence(self) -> None:
+        """每日一言：先沿用当天缓存，没有缓存再到后台拉取，保证不阻塞启动。"""
+        data_dir = config_dir(self.data_dir)
+
+        def work() -> None:
+            sentence = load_cached(data_dir)
+            if sentence is None:
+                try:
+                    downloader = self.make_downloader(progress=False)
+                    sentence = today_sentence(data_dir, downloader=downloader)
+                except Exception:  # noqa: BLE001 - 彩蛋文案不能影响启动
+                    sentence = FALLBACK
+            self.post(lambda s=sentence: self._apply_daily_sentence(s))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_daily_sentence(self, sentence) -> None:
+        label = getattr(self, "daily_label", None)
+        if label is None:
+            return
+        label.setText(sentence.display)
+        label.setToolTip(sentence.display)
 
     def _build_home_version_bar(self) -> QWidget:
         """右侧顶部 5k：左边是当前版本（可下拉切换），右边是目录路径。"""
@@ -885,6 +1329,8 @@ class MainWindow(QMainWindow):
         mods_open = QPushButton("打开目录")
         mods_open.setObjectName("segment")
         mods_open.setToolTip("打开当前版本的 mods 目录")
+        mods_open.setIcon(QIcon(icon_pixmap("folder", 14, "#5B6678")))
+        mods_open.setIconSize(QSize(14, 14))
         mods_open.clicked.connect(self._open_mods_dir)
         head.addWidget(mods_open)
         mods.add_layout(head)
@@ -904,6 +1350,8 @@ class MainWindow(QMainWindow):
         saves_open = QPushButton("打开目录")
         saves_open.setObjectName("segment")
         saves_open.setToolTip("打开当前版本的 saves 目录")
+        saves_open.setIcon(QIcon(icon_pixmap("folder", 14, "#5B6678")))
+        saves_open.setIconSize(QSize(14, 14))
         saves_open.clicked.connect(self._open_saves_dir)
         head2.addWidget(saves_open)
         saves.add_layout(head2)
@@ -952,6 +1400,8 @@ class MainWindow(QMainWindow):
         self.home_java.currentIndexChanged.connect(self._on_home_java_changed)
         java_row.addWidget(self.home_java, 1)
         detect = QPushButton("重新检测")
+        detect.setIcon(QIcon(icon_pixmap("refresh", 14, "#5B6678")))
+        detect.setIconSize(QSize(14, 14))
         detect.clicked.connect(self._refresh_java_combo)
         java_row.addWidget(detect)
         card.add_layout(java_row)
@@ -1084,6 +1534,10 @@ class MainWindow(QMainWindow):
             button.setObjectName("nav")
             button.setMinimumHeight(u(2.75))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._set_tab_icon(button, key, False)
+            button.toggled.connect(
+                lambda checked, b=button, k=key: self._set_tab_icon(b, k, checked)
+            )
             button.clicked.connect(lambda _c, name=key: self.switch_tab(name))
             group.addButton(button)
             column.addWidget(button)
@@ -1145,6 +1599,8 @@ class MainWindow(QMainWindow):
         banner_layout.addLayout(banner_text, 1)
         self.banner_button = QPushButton("安装最新版")
         self.banner_button.setObjectName("accent")
+        self.banner_button.setIcon(QIcon(icon_pixmap("download", 15, "#FFFFFF")))
+        self.banner_button.setIconSize(QSize(15, 15))
         self.banner_button.setEnabled(False)
         self.banner_button.clicked.connect(self._install_latest)
         banner_layout.addWidget(self.banner_button)
@@ -1192,11 +1648,16 @@ class MainWindow(QMainWindow):
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         body.add(self.game_tree, 1)
         footer = QHBoxLayout()
+        footer.setSpacing(8)
+        self.game_spinner = Spinner(15, ACCENT)
+        footer.addWidget(self.game_spinner)
         self.game_count = self._label("")
         footer.addWidget(self.game_count)
         footer.addStretch(1)
         self.game_install_button = QPushButton("安装所选版本")
         self.game_install_button.setObjectName("accent")
+        self.game_install_button.setIcon(QIcon(icon_pixmap("download", 15, "#FFFFFF")))
+        self.game_install_button.setIconSize(QSize(15, 15))
         self.game_install_button.clicked.connect(self._on_game_action)
         footer.addWidget(self.game_install_button)
         body.add_layout(footer)
@@ -1572,29 +2033,69 @@ class MainWindow(QMainWindow):
             return
         self.launch_game(instance, quick_play=address)
 
+    def _avatar_pixmap(self, name: str, size: int) -> QPixmap:
+        """账号头像：优先本地缓存皮肤 → 内置默认皮肤 → 首字母色块。"""
+        data = SkinPage.current_avatar(name, size)
+        if data:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(data) and self._has_visible_pixels(pixmap):
+                return self._round_pixmap(pixmap, size)
+        # 缓存皮肤损坏（全透明）时回退到内置默认皮肤，避免头像留白
+        data = head_avatar(default_skin_bytes(), size=size)
+        pixmap = QPixmap()
+        if data and pixmap.loadFromData(data):
+            return self._round_pixmap(pixmap, size)
+        return initial_pixmap(name, size, "account")
+
+    @staticmethod
+    def _round_pixmap(pixmap: QPixmap, size: int) -> QPixmap:
+        """给头像裁出圆角，跟上卡片风格。"""
+        result = QPixmap(pixmap.size())
+        result.setDevicePixelRatio(pixmap.devicePixelRatio())
+        result.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(pixmap.rect()), size * 0.18, size * 0.18)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return result
+
+    @staticmethod
+    def _has_visible_pixels(pixmap: QPixmap) -> bool:
+        """头像是否至少有一个不透明像素（全透明的皮肤缓存等同无效）。"""
+        image = pixmap.toImage()
+        for y in range(0, image.height(), 4):
+            for x in range(0, image.width(), 4):
+                if image.pixelColor(x, y).alpha() > 0:
+                    return True
+        return False
+
     def apply_avatar(self, data: bytes) -> None:
         """上传成功后刷新启动页头像；字节无效时保持初始头像不变。"""
         if not data:
             return
         pixmap = QPixmap()
         if pixmap.loadFromData(data):
-            self.avatar.setPixmap(
-                pixmap.scaled(
-                    AVATAR_PX,
-                    AVATAR_PX,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation,
-                )
+            scaled = pixmap.scaled(
+                AVATAR_PX,
+                AVATAR_PX,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
+            self.avatar.setPixmap(self._round_pixmap(scaled, AVATAR_PX))
 
     def open_skin_page(self) -> None:
         """把皮肤页包成对话框弹出（入口：启动页账号行与设置页卡片）。"""
         dialog = QDialog(self)
         dialog.setWindowTitle("自定义皮肤")
-        dialog.resize(u(40), u(28))
+        dialog.resize(u(48), u(36))
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(SkinPage(self))
+        page = SkinPage(self)
+        layout.addWidget(page)
+        dialog.finished.connect(lambda _code: page.shutdown())
         dialog.exec()
 
     def register_plugin_nav(self, plugin_id: str, label: str, factory: Callable[[], Any]) -> None:
@@ -1628,6 +2129,8 @@ class MainWindow(QMainWindow):
         )
         banner_layout.addLayout(text, 1)
         refresh = QPushButton("刷新列表")
+        refresh.setIcon(QIcon(icon_pixmap("refresh", 15, "#5B6678")))
+        refresh.setIconSize(QSize(15, 15))
         refresh.clicked.connect(self._refresh_java_tab)
         banner_layout.addWidget(refresh)
         layout.addWidget(banner)
@@ -1650,10 +2153,14 @@ class MainWindow(QMainWindow):
         self.java_set_button.clicked.connect(self._set_selected_java)
         footer.addWidget(self.java_set_button)
         self.java_open_button = QPushButton("打开目录")
+        self.java_open_button.setIcon(QIcon(icon_pixmap("folder", 15, "#5B6678")))
+        self.java_open_button.setIconSize(QSize(15, 15))
         self.java_open_button.clicked.connect(self._open_java_dir)
         footer.addWidget(self.java_open_button)
         self.java_install_button = QPushButton("下载并安装")
         self.java_install_button.setObjectName("accent")
+        self.java_install_button.setIcon(QIcon(icon_pixmap("download", 15, "#FFFFFF")))
+        self.java_install_button.setIconSize(QSize(15, 15))
         self.java_install_button.clicked.connect(self._install_selected_java)
         footer.addWidget(self.java_install_button)
         body.add_layout(footer)
@@ -1803,6 +2310,47 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 10, 0)
         layout.setSpacing(12)
 
+        look = Card()
+        look.add(self._label("外观", "h2"))
+        look_hint = self._label(
+            "背景支持纯色、PNG 或 GIF。图片与颜色同时启用时，会在图片上蒙一层很淡的颜色；"
+            "默认渐变始终保留在最底层，图片带透明通道也不会露底。"
+        )
+        look_hint.setWordWrap(True)
+        look.add(look_hint)
+
+        bg_row = QHBoxLayout()
+        bg_row.setSpacing(8)
+        self.settings_bg_name = ElidedLabel("")
+        bg_row.addWidget(self.settings_bg_name, 1)
+        bg_pick = QPushButton("选择图片")
+        bg_pick.setIcon(QIcon(icon_pixmap("image", 14, "#5B6678")))
+        bg_pick.setIconSize(QSize(14, 14))
+        bg_pick.clicked.connect(self._choose_background_image)
+        bg_row.addWidget(bg_pick)
+        bg_clear = QPushButton("清除")
+        bg_clear.setIcon(QIcon(icon_pixmap("close", 12, "#5B6678")))
+        bg_clear.setIconSize(QSize(12, 12))
+        bg_clear.clicked.connect(self._clear_background_image)
+        bg_row.addWidget(bg_clear)
+        look.add_layout(bg_row)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(8)
+        self.settings_bg_swatch = QPushButton()
+        self.settings_bg_swatch.setFixedSize(30, 30)
+        self.settings_bg_swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_bg_swatch.setToolTip("打开色盘选择背景颜色")
+        self.settings_bg_swatch.clicked.connect(self._choose_background_color)
+        color_row.addWidget(self.settings_bg_swatch)
+        self.settings_bg_color_text = self._label("")
+        color_row.addWidget(self.settings_bg_color_text, 1)
+        bg_color_clear = QPushButton("清除颜色")
+        bg_color_clear.clicked.connect(self._clear_background_color)
+        color_row.addWidget(bg_color_clear)
+        look.add_layout(color_row)
+        layout.addWidget(look)
+
         game = Card()
         game.add(self._label("游戏", "h2"))
         row = QHBoxLayout()
@@ -1829,6 +2377,8 @@ class MainWindow(QMainWindow):
         self.settings_java = QComboBox()
         java_row.addWidget(self.settings_java, 1)
         detect = QPushButton("重新检测")
+        detect.setIcon(QIcon(icon_pixmap("refresh", 14, "#5B6678")))
+        detect.setIconSize(QSize(14, 14))
         detect.clicked.connect(self._refresh_java_combo)
         java_row.addWidget(detect)
         add_java = QPushButton("添加 Java")
@@ -1873,11 +2423,12 @@ class MainWindow(QMainWindow):
             field.setReadOnly(True)
             field.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             field.setVisible(False)
-        self.settings_fastest = QCheckBox("下载时比较镜像与直连的延迟，自动用更快的一边")
+        self.settings_fastest = QCheckBox("探测各下载源的延迟与速度，自动择优（下载过慢时切源）")
         self.settings_fastest.setChecked(bool(getattr(self.config, "prefer_fastest", True)))
         self.settings_fastest.setToolTip(
-            "开启后，每一类资源下载前会先各测一次首字节耗时（只读 2 KB），\n"
-            "更快的通道会被自动选中；结论 10 分钟内复用。"
+            "开启后，探测前会清理 DNS 缓存，再测各源的首字节延迟与下载速度，\n"
+            "按「延迟 + 速率」选出更快的源（结论 10 分钟内复用）；\n"
+            "下载过程中速率过低会重新探测并切换到更快的源（断点续传）。"
         )
         download.add(self.settings_fastest)
         workers_row = QHBoxLayout()
@@ -1897,6 +2448,16 @@ class MainWindow(QMainWindow):
         skin_text = self._label("为当前账户上传自定义皮肤（需装了 CustomSkinLoader 的实例才会显示）")
         skin_text.setWordWrap(True)
         skin_card.add(skin_text)
+        style_row = QHBoxLayout()
+        style_row.setSpacing(8)
+        style_row.addWidget(self._label("皮肤页样式"))
+        self.settings_skin_layout = QComboBox()
+        for key, name in LAYOUT_CHOICES:
+            self.settings_skin_layout.addItem(name, key)
+        self.settings_skin_layout.setToolTip("保存设置后，重新打开皮肤页即可切换布局")
+        style_row.addWidget(self.settings_skin_layout)
+        style_row.addStretch(1)
+        skin_card.add_layout(style_row)
         skin_open = QPushButton("上传自定义皮肤")
         skin_open.clicked.connect(self.open_skin_page)
         skin_card.add(skin_open)
@@ -1904,6 +2465,8 @@ class MainWindow(QMainWindow):
 
         if self.plugin_registry.get("diagnostics") is not None:
             layout.addWidget(self._build_diagnostics_card())
+
+        layout.addWidget(self._build_update_card())
 
         about = Card()
         about.add(self._label("关于", "h2"))
@@ -1920,6 +2483,13 @@ class MainWindow(QMainWindow):
         open_data = QPushButton("打开数据目录")
         open_data.clicked.connect(self._open_data_dir)
         about_row.addWidget(open_data)
+        open_data.setCursor(Qt.CursorShape.PointingHandCursor)
+        easter = QPushButton("千万别点")
+        easter.setObjectName("ghost")
+        easter.setToolTip("真的别点。")
+        easter.setCursor(Qt.CursorShape.PointingHandCursor)
+        easter.clicked.connect(self._trigger_easter_egg)
+        about_row.addWidget(easter)
         about_row.addStretch(1)
         about.add_layout(about_row)
         layout.addWidget(about)
@@ -1929,6 +2499,88 @@ class MainWindow(QMainWindow):
         right_column.addWidget(scroll, 1)
         outer.addWidget(right, 1)
         return page
+
+    # ------------------------------------------------------------- 自更新
+    def _build_update_card(self) -> Card:
+        card = Card()
+        card.add(self._label("更新", "h2"))
+        hint = self._label(
+            "检查更新先测 GitHub 直连延迟；过高时清理 DNS 缓存并重测，"
+            "仍然偏高就改用镜像下载，支持断点续传。"
+        )
+        hint.setWordWrap(True)
+        card.add(hint)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.update_status = self._label(f"当前版本 v{__version__}")
+        self.update_status.setWordWrap(True)
+        row.addWidget(self.update_status, 1)
+        self.update_button = QPushButton("检查更新")
+        self.update_button.setIcon(QIcon(icon_pixmap("refresh", 14, "#5B6678")))
+        self.update_button.setIconSize(QSize(14, 14))
+        self.update_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_button.clicked.connect(self.check_for_update)
+        row.addWidget(self.update_button)
+        card.add_layout(row)
+        return card
+
+    def check_for_update(self) -> None:
+        """后台检查更新：探测直连 → 清 DNS 重测 → 必要时走镜像。"""
+        if getattr(self, "_update_running", False):
+            return
+        self._update_running = True
+        self.update_button.setEnabled(False)
+        self.update_status.setText("正在检查更新…")
+        base = (self.config.download_base or "").strip()
+        token = self.config.download_token or ""
+        proxy = self.config.proxy or None
+
+        def report(text: str) -> None:
+            self.events.put(("call", lambda t=text: self.update_status.setText(t)))
+
+        def progress(tracker) -> None:
+            snap = tracker.snapshot()
+            percent = snap.get("percent")
+            if percent is None:
+                report(f"正在下载安装包… {snap['done_bytes'] / 1048576:.1f} MB")
+            else:
+                report(f"正在下载安装包… {percent:.0f}%（{snap['speed'] / 1048576:.1f} MB/s）")
+
+        def worker() -> None:
+            try:
+                release = update_client.fetch_release(base, token=token, proxy=proxy)
+                if not update_client.is_newer(release.version, __version__):
+                    report(f"已是最新版本 v{__version__}（最新 v{release.version or '未知'}）")
+                    return
+                report(f"发现新版本 v{release.version}，正在选择下载源…")
+                plan = update_client.plan_download(release, proxy=proxy)
+                report(f"{plan.detail()}，开始下载…")
+                dest = update_client.download_installer(
+                    plan,
+                    config_dir(self.data_dir) / "updates",
+                    proxy=proxy,
+                    token=token,
+                    mirror_origin=base,
+                    progress=progress,
+                )
+                report(f"v{release.version} 已下载到 {dest}，双击安装即可")
+            except Exception as exc:  # noqa: BLE001 - 更新失败不应影响主流程
+                report(f"更新失败：{exc}")
+            finally:
+                self.events.put(("call", self._finish_update_check))
+
+        threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _finish_update_check(self) -> None:
+        self._update_running = False
+        if hasattr(self, "update_button"):
+            self.update_button.setEnabled(True)
+
+    def _trigger_easter_egg(self) -> None:
+        """彩蛋：进入「点哪掉哪」模式，页面保持原样。重复点击不会叠加。"""
+        if getattr(self, "_falling_overlay", None) is not None:
+            return
+        self._falling_overlay = FallingOverlay(self)
 
     # ------------------------------------------------------------- 连通性自检（官方插件）
     def _build_diagnostics_card(self) -> Card:
@@ -2062,6 +2714,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(page)
         for key, button in self.nav_buttons.items():
             button.setChecked(key == name)
+        self._sync_content_timer(name)
         if name == "home":
             self.refresh_instances()
         elif name == "online":
@@ -2260,7 +2913,7 @@ class MainWindow(QMainWindow):
             return
         self.config.username = name
         save_config(self.config, self.data_dir)
-        self.avatar.setPixmap(initial_pixmap(name, u(15), "account"))
+        self.avatar.setPixmap(self._avatar_pixmap(name, AVATAR_PX))
         self.notice(f"已切换离线账户：{name}")
 
     def _edit_account(self) -> None:
@@ -2398,6 +3051,7 @@ class MainWindow(QMainWindow):
         self._version_rows = []
 
         if self._segment == "installed":
+            self.game_spinner.stop()
             self.game_tree.setHeaderLabels(["版本", "加载器", "最近使用", "大小"])
             for item in self.instances:
                 node = QTreeWidgetItem(
@@ -2416,8 +3070,10 @@ class MainWindow(QMainWindow):
         manifest = self.manifest
         if manifest is None:
             self.game_count.setText("版本清单加载中……")
+            self.game_spinner.start()
             self.game_install_button.setEnabled(False)
             return
+        self.game_spinner.stop()
         kinds = SEGMENT_KINDS.get(self._segment, {"release"})
         items = manifest.filter(kinds, self.game_search.text())
         installed = {item.id for item in self.instances}
@@ -2598,7 +3254,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- 内容下载
     def content_client(self) -> ModrinthClient:
-        key = (self.config.download_base or "", self.config.proxy, self.config.download_token)
+        key = (
+            tuple(self.source_bases()),
+            self.config.proxy,
+            self.config.download_token,
+        )
         if self._content_client is None or self._content_key != key:
             self._content_client = ModrinthClient(
                 self.config.download_base or "",
@@ -2699,8 +3359,9 @@ class MainWindow(QMainWindow):
         self.run_task(f"安装整合包 {hit.title}", worker)
 
     # ------------------------------------------------------------- 版本清单
-    def ensure_manifest(self, cancel: threading.Event | None = None) -> VersionManifest:
-        if self.manifest is not None:
+    def ensure_manifest(self, cancel: threading.Event | None = None, force: bool = False) -> VersionManifest:
+        # force=True 时即使已有缓存清单也会重新向下载源拉取（启动时即刷新版本任务）
+        if self.manifest is not None and not force:
             return self.manifest
         downloader = self.make_downloader(progress=False, workers=2)
         data = downloader.fetch_json(self.source(downloader).rewrite(MANIFEST_URL))
@@ -2723,10 +3384,14 @@ class MainWindow(QMainWindow):
 
         def worker() -> None:
             try:
-                self.ensure_manifest()
+                self.ensure_manifest(force=True)
             except Exception as exc:  # noqa: BLE001
                 self.post_log("ERROR", f"版本清单获取失败：{exc}")
-                self.events.put(("status", "版本清单获取失败，可在「设置」中修改下载源"))
+                if self.manifest is not None:
+                    # 已有缓存清单时不影响使用，只提示刷新失败
+                    self.events.put(("status", "版本清单刷新失败，继续使用本地缓存"))
+                else:
+                    self.events.put(("status", "版本清单获取失败，可在「设置」中修改下载源"))
             finally:
                 self._remote_loading = False
 
@@ -2769,7 +3434,7 @@ class MainWindow(QMainWindow):
         return Downloader(
             proxy=self.config.proxy or None,
             token=self.config.download_token or None,
-            # 令牌只发给配置的镜像源，官方源/第三方 CDN 一律不带
+            # 令牌只发给配置的主镜像源，官方源/第三方 CDN 一律不带
             token_origin=self.config.download_base or None,
             workers=workers or self.config.max_workers,
             timeout=30,
@@ -2779,21 +3444,59 @@ class MainWindow(QMainWindow):
                 else None
             ),
             progress_interval=0.25,
+            # 下载过慢时重新探测各源，并从断点切换到更快的源
+            url_resolver=self._resolve_source_url,
         )
 
+    def source_bases(self) -> list[str]:
+        """当前配置的下载源列表（空串表示官方直连，末尾始终保留直连兜底）。"""
+        raw = getattr(self.config, "download_sources", None) or [
+            self.config.download_base
+        ]
+        bases: list[str] = []
+        for item in raw:
+            text = str(item or "").strip().rstrip("/")
+            if text not in bases:
+                bases.append(text)
+        if not bases:
+            bases = [""]
+        if "" not in bases:
+            bases.append("")
+        return bases
+
+    def _resolve_source_url(self, url: str) -> str | None:
+        """下载器报告速率过低时：重新探测所有源并返回更快的地址。"""
+        try:
+            source = self.source()
+        except Exception:  # noqa: BLE001 - 重测失败不应中断下载
+            return None
+        resolver = getattr(source, "resolve_again", None)
+        if not callable(resolver):
+            return None
+        try:
+            new_url = resolver(url)
+        except Exception as exc:  # noqa: BLE001 - 重测失败不影响断点续传
+            self.post_log("WARN", f"重新探测下载源失败：{exc}")
+            return None
+        if new_url and new_url != url:
+            self.post_log("INFO", f"下载过慢，已切换下载源：{new_url}")
+            return new_url
+        return None
+
     def source(self, downloader: Downloader | None = None):
-        """当前下载源：在镜像与直连之间按实测时延择优。
+        """当前下载源：在多源与官方直连之间按「延迟 + 速率」择优。
 
         返回对象与 :class:`offcraft.mirror.Mirror` 接口一致（``rewrite`` 等），
         可直接传给安装计划、加载器安装等函数。探测结论按 10 分钟缓存，
         因此同一个窗口内不会反复测时。
         """
         enabled = bool(getattr(self.config, "prefer_fastest", True))
-        key = f"{self.config.download_base}|{self.config.proxy}|{enabled}"
+        bases = self.source_bases()
+        key = (tuple(bases), self.config.proxy or "", self.config.download_token or "", enabled)
         cached = self._sources.get(key)
         if cached is None:
             cached = make_source(
-                self.config.download_base,
+                sources=bases,
                 downloader=downloader,
                 proxy=self.config.proxy,
                 token=self.config.download_token,
@@ -2994,9 +3697,11 @@ class MainWindow(QMainWindow):
                     self._apply_icon(payload)
                 elif kind == "launch_started":
                     self.launch_button.setText("结束游戏")
+                    self.launch_button.setIcon(QIcon(icon_pixmap("stop", 20, "#FFFFFF")))
                 elif kind == "launch_done":
                     self.process = None
                     self.launch_button.setText("启动游戏")
+                    self.launch_button.setIcon(QIcon(icon_pixmap("play", 20, "#FFFFFF")))
                     self.status_dot.setStyleSheet(f"color: {OK}; font-size: 11pt;")
                     self.status_label.setText("游戏已退出")
                 elif kind == "task_done":
@@ -3036,6 +3741,7 @@ class MainWindow(QMainWindow):
         self._load_settings_values()
         self.manifest = None
         self._content_client = None
+        self._sources.clear()
         self.post_log("INFO", "下载源已更新")
         self.refresh_remote()
 
@@ -3059,7 +3765,75 @@ class MainWindow(QMainWindow):
         self.settings_workers.setValue(int(self.config.max_workers))
         if hasattr(self, "settings_fastest"):
             self.settings_fastest.setChecked(bool(getattr(self.config, "prefer_fastest", True)))
+        if hasattr(self, "settings_skin_layout"):
+            index = self.settings_skin_layout.findData(getattr(self.config, "skin_layout", "v1"))
+            self.settings_skin_layout.setCurrentIndex(index if index >= 0 else 0)
+        self._sync_appearance_controls()
         self._refresh_java_combo()
+
+    # ------------------------------------------------------------- 背景外观
+    def _sync_appearance_controls(self) -> None:
+        """同步设置页里的背景图文件名与颜色样本。"""
+        if hasattr(self, "settings_bg_name"):
+            image = getattr(self.config, "bg_image", "")
+            self.settings_bg_name.setText(
+                Path(image).name if image else "未选择图片（支持 PNG / GIF）"
+            )
+            self.settings_bg_name.setToolTip(image or "")
+        if hasattr(self, "settings_bg_color_text"):
+            color = getattr(self.config, "bg_color", "")
+            self.settings_bg_color_text.setText(
+                f"颜色 {color}" if color else "未设置颜色（使用默认渐变）"
+            )
+        if hasattr(self, "settings_bg_swatch"):
+            color = getattr(self.config, "bg_color", "")
+            fill = color or "rgba(255, 255, 255, 0.9)"
+            self.settings_bg_swatch.setStyleSheet(
+                "QPushButton {"
+                f" background: {fill};"
+                " border: 1px solid #C7D0DE; border-radius: 9px;"
+                "}"
+            )
+
+    def _choose_background_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择背景图片",
+            self.config.bg_image or "",
+            "图片 (*.png *.gif *.jpg *.jpeg *.bmp *.webp);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        self.config.bg_image = path
+        self.apply_background()
+        self._sync_appearance_controls()
+        save_config(self.config, self.data_dir)
+
+    def _clear_background_image(self) -> None:
+        if not self.config.bg_image:
+            return
+        self.config.bg_image = ""
+        self.apply_background()
+        self._sync_appearance_controls()
+        save_config(self.config, self.data_dir)
+
+    def _choose_background_color(self) -> None:
+        start = QColor(self.config.bg_color) if self.config.bg_color else QColor("#EAF1FF")
+        color = QColorDialog.getColor(start, self, "选择背景颜色")
+        if not color.isValid():
+            return
+        self.config.bg_color = color.name().upper()
+        self.apply_background()
+        self._sync_appearance_controls()
+        save_config(self.config, self.data_dir)
+
+    def _clear_background_color(self) -> None:
+        if not self.config.bg_color:
+            return
+        self.config.bg_color = ""
+        self.apply_background()
+        self._sync_appearance_controls()
+        save_config(self.config, self.data_dir)
 
     def save_settings(self) -> None:
         self.config.game_dir = self.settings_game_dir.text().strip()
@@ -3069,6 +3843,8 @@ class MainWindow(QMainWindow):
         self.config.extra_jvm = [part for part in self.settings_jvm.text().split(" ") if part]
         if hasattr(self, "settings_fastest"):
             self.config.prefer_fastest = self.settings_fastest.isChecked()
+        if hasattr(self, "settings_skin_layout"):
+            self.config.skin_layout = self.settings_skin_layout.currentData() or "v1"
         save_config(self.config, self.data_dir)
 
         self.home_memory.blockSignals(True)
@@ -3161,6 +3937,23 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self.config.window = {"w": self.width(), "h": self.height()}
         save_config(self.config, self.data_dir)
+        # 关闭按钮默认收进系统托盘；从托盘菜单「退出」时才真正结束进程
+        if (
+            not self._force_quit
+            and self.tray is not None
+            and self.tray.isVisible()
+        ):
+            event.ignore()
+            self.hide()
+            if not self._tray_notice_shown:
+                self._tray_notice_shown = True
+                self.tray.showMessage(
+                    APP_NAME,
+                    "已最小化到系统托盘，右键托盘图标可显示或退出。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    2000,
+                )
+            return
         if self.process is not None and self.process.running:
             answer = QMessageBox.question(self, APP_NAME, "游戏仍在运行，确定退出启动器？")
             if answer != QMessageBox.StandardButton.Yes:
@@ -3168,6 +3961,11 @@ class MainWindow(QMainWindow):
                 return
             self.process.stop()
         self._timer.stop()
+        self._content_timer.stop()
+        if hasattr(self, "backdrop"):
+            self.backdrop.shutdown()
+        if self.tray is not None:
+            self.tray.hide()
         panel = getattr(self, "_offline_panel", None)
         if panel is not None:
             try:
