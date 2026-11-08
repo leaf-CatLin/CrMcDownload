@@ -1,12 +1,13 @@
 [project]
 name = "offcraft"
-version = "0.8.0"
+version = "0.8.5"
 description = "CrMcDownload - Minecraft launcher client (download, install, offline launch)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
-# GUI（PyQt6）由运行环境提供；皮肤校验 / 头像裁切依赖 Pillow；离线联机（P2P）依赖 PyNaCl（libsodium 绑定）
-dependencies = ["pillow>=10", "pynacl>=1.5"]
+# GUI（PyQt6）由运行环境提供；皮肤校验 / 头像裁切依赖 Pillow；离线联机（P2P）依赖 PyNaCl（libsodium 绑定）；
+# 正版登录的内嵌 WebView2 登录窗口依赖 pywebview（Windows 下经 pythonnet 调用系统 WebView2 运行时）。
+dependencies = ["pillow>=10", "pynacl>=1.5", "pywebview>=5"]
 
 [tool.uv]
 # 纯应用工程：不构建 wheel；GUI 走系统已有 PyQt6，仅显式声明 Pillow

@@ -2,7 +2,10 @@
 
 只与 ``download_base`` 通信：``/api/servers/*`` 是服务端自有的 JSON 接口，
 不做 URL 改写（不属于代理路由），因此这里直接拼 ``{base}/api/...``。
-写接口（上报新服务器）才需要令牌，令牌按 :class:`Downloader` 的 origin 规则发送。
+写接口（上报服务器、举报服务器）才需要令牌，令牌按 :class:`Downloader` 的 origin 规则发送。
+
+隐私约定：本地收藏/最近访问只是本机数据，**不会自动上传**；
+只有用户在界面上手动确认「上报」或「举报」后才会调用这里的方法。
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
+from offcraft import __version__
 from offcraft.net.downloader import DownloadError, Downloader
 from offcraft.servers.ping import PlayerEntry
 from offcraft.servers.ssrf import DEFAULT_PORT, ServerAddressError, parse_server
@@ -144,16 +148,19 @@ class ServerDirectory:
         return self._get("servers/detail", {"host": host, "port": int(port)})
 
     def report(self, text: str, label: str = "") -> None:
-        """将用户新增的服务器上报给服务端（失败不打扰用户）。"""
+        """把服务器上报到公共榜单；仅供用户手动确认后调用。
+
+        失败时抛出 :class:`DirectoryError`，由界面提示用户（不再静默吞掉）。
+        """
         if not self.base:
-            return
+            raise DirectoryError("未配置下载源，无法上报服务器")
         try:
             host, port = parse_server(text)
         except ServerAddressError as exc:
             raise DirectoryError(str(exc)) from exc
         downloader = self.downloader
         if downloader is None:
-            return
+            raise DirectoryError("下载器不可用")
         try:
             downloader.request_json(
                 self._url("servers/report"),
@@ -161,8 +168,37 @@ class ServerDirectory:
                 body={"host": host, "port": port, "label": label or ""},
             )
         except DownloadError as exc:
-            # 上报失败只是少一条热度数据，不影响本地收藏
-            self.notes.append(f"服务器已加入本地收藏，上报榜单失败：{exc}")
+            raise DirectoryError(f"上报失败：{exc}") from exc
+
+    def complain(
+        self,
+        host: str,
+        port: int,
+        reason: str,
+        detail: str = "",
+        contact: str = "",
+    ) -> None:
+        """举报一台服务器（用户手动提交，服务端人工审核，不会公开身份）。"""
+        if not self.base:
+            raise DirectoryError("未配置下载源，无法提交举报")
+        downloader = self.downloader
+        if downloader is None:
+            raise DirectoryError("下载器不可用")
+        try:
+            downloader.request_json(
+                self._url("servers/complaints"),
+                "POST",
+                body={
+                    "host": str(host or "").strip(),
+                    "port": int(port),
+                    "reason": str(reason or "").strip()[:24],
+                    "detail": str(detail or "").strip()[:500],
+                    "contact": str(contact or "").strip()[:120],
+                    "client": __version__,
+                },
+            )
+        except DownloadError as exc:
+            raise DirectoryError(f"举报提交失败：{exc}") from exc
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.base:

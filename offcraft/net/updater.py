@@ -43,7 +43,7 @@ DEFAULT_THRESHOLD_MS = 1200
 #: 探测超时（秒）
 DEFAULT_PROBE_TIMEOUT = 6.0
 #: 无镜像地址时用于查询最新版本的 GitHub API
-GITHUB_LATEST_API = "https://api.github.com/repos/crazying-dev/CrMcDownload/releases/latest"
+GITHUB_LATEST_API = "https://api.github.com/repos/leaf-CatLin/CrMcDownload/releases/latest"
 
 
 @dataclass(slots=True)

@@ -69,7 +69,7 @@ class Config:
     skin_model: str = "auto"
     #: 皮肤页布局：``v1`` 双栏卡片（默认） / ``v2`` 工作台 / ``v3`` 极简单栏
     skin_layout: str = "v1"
-    #: 账户提供者（本次仅 ``offline``；预留给外置登录）
+    #: 账户提供者：``offline``（离线） / ``microsoft``（正版 Microsoft 登录）
     account_provider: str = "offline"
     #: 离线联机（P2P）：默认关闭，需显式开启（特权插件，走端到端加密隧道）
     p2p_enabled: bool = False
@@ -121,7 +121,7 @@ class Config:
             self.skin_model = "auto"
         if self.skin_layout not in ("v1", "v2", "v3"):
             self.skin_layout = "v1"
-        if not self.account_provider:
+        if self.account_provider not in ("offline", "microsoft"):
             self.account_provider = "offline"
         if not self.username:
             self.username = "Player"

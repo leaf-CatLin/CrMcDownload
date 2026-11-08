@@ -13,9 +13,13 @@ from typing import Any
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -54,6 +58,69 @@ def _listing_from(entry: ServerEntry, result: ProbeResult | None, base: ServerLi
         item.players = tuple(result.players or ())
         item.players_visible = bool(result.players)
     return item
+
+
+class ComplaintDialog(QDialog):
+    """举报服务器：原因 + 补充说明 + 可选联系方式。"""
+
+    REASONS = (
+        "无法连接 / 长期离线",
+        "服务器信息与实际不符",
+        "含违规内容（色情、赌博、诈骗等）",
+        "外挂 / 作弊服务器",
+        "冒充他人服务器",
+        "其他问题",
+    )
+
+    def __init__(self, parent: QWidget, listing: ServerListing) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("举报服务器")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(8)
+
+        title = QLabel(f"举报 {listing.name}")
+        title.setStyleSheet("font-weight: 700;")
+        layout.addWidget(title)
+        hint = QLabel(
+            "举报会发送服务器地址、举报原因、说明与可选联系方式，由人工审核；不会公开你的身份。"
+            "只有你点击「提交举报」后才会发送。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {MUTED};")
+        layout.addWidget(hint)
+
+        self.reason = QComboBox()
+        self.reason.addItems(self.REASONS)
+        layout.addWidget(self.reason)
+
+        self.detail = QPlainTextEdit()
+        self.detail.setPlaceholderText("补充说明（可选，最多 500 字）")
+        self.detail.setFixedHeight(84)
+        layout.addWidget(self.detail)
+
+        self.contact = QLineEdit()
+        self.contact.setPlaceholderText("联系方式（可选，必要时回访，不会公开）")
+        layout.addWidget(self.contact)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        submit = QPushButton("提交举报")
+        submit.setObjectName("accent")
+        submit.clicked.connect(self.accept)
+        buttons.addWidget(submit)
+        layout.addLayout(buttons)
+
+    def values(self) -> tuple[str, str, str]:
+        return (
+            self.reason.currentText(),
+            self.detail.toPlainText().strip()[:500],
+            self.contact.text().strip()[:120],
+        )
 
 
 class ServerCard(QWidget):
@@ -118,6 +185,8 @@ class ServerCard(QWidget):
             ("复制", self._on_copy),
             ("详情", self._on_detail),
             ("收藏", self._on_favorite),
+            ("上报", self._on_report),
+            ("举报", self._on_complain),
             ("加入游戏", self._on_join),
         ):
             button = QPushButton(text)
@@ -148,6 +217,12 @@ class ServerCard(QWidget):
 
     def _on_favorite(self) -> None:
         self.page.toggle_favorite(self.listing)
+
+    def _on_report(self) -> None:
+        self.page.report_listing(self.listing)
+
+    def _on_complain(self) -> None:
+        self.page.complain_about(self.listing)
 
     def _on_join(self) -> None:
         self.page.join(self.listing)
@@ -403,24 +478,53 @@ class OnlinePage(QWidget):
 
     def toggle_favorite(self, listing: ServerListing) -> None:
         existing = self.store.get(listing.host, listing.port)
-        entry = ServerEntry(host=listing.host, port=listing.port, label=listing.label)
         if existing is not None:
             self.store.remove(listing.host, listing.port)
             self.window.notice("已取消收藏", "INFO")
         else:
+            # 只写入本机收藏：不上传服务器，除非用户在卡片上手动点「上报」
             self.store.add(listing.address, listing.label)
-            self.window.notice("已加入收藏", "INFO")
-            self._report(entry)
+            self.window.notice("已加入收藏（仅保存在本机）", "INFO")
         self._rebuild()
 
-    def _report(self, entry: ServerEntry) -> None:
-        address, label = entry.address, entry.label
+    def report_listing(self, listing: ServerListing) -> None:
+        """手动上报服务器到公共榜单（用户确认后才发送）。"""
+        answer = QMessageBox.question(
+            self.window,
+            "上报服务器",
+            f"将把 {listing.address} 与备注上报到公共榜单，供其他玩家发现。\n"
+            "只有点击「是」才会发送，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        entry = ServerEntry(host=listing.host, port=listing.port, label=listing.label)
 
         def worker() -> None:
             try:
-                self._directory().report(address, label)
-            except Exception:  # noqa: BLE001 - 上报失败不影响本地收藏
-                pass
+                self._directory().report(entry.address, entry.label)
+            except Exception as exc:  # noqa: BLE001 - 失败提示用户
+                self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
+                return
+            self.window.post(lambda: self.window.notice("已上报到公共榜单，审核后展示", "OK"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def complain_about(self, listing: ServerListing) -> None:
+        """手动举报服务器（人工审核，不公开举报者身份）。"""
+        dialog = ComplaintDialog(self.window, listing)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        reason, detail, contact = dialog.values()
+
+        def worker() -> None:
+            try:
+                self._directory().complain(listing.host, listing.port, reason, detail, contact)
+            except Exception as exc:  # noqa: BLE001 - 失败提示用户
+                self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
+                return
+            self.window.post(lambda: self.window.notice("举报已提交，感谢反馈", "OK"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -438,8 +542,7 @@ class OnlinePage(QWidget):
             self.window.notice(f"添加失败：{exc}", "WARN")
             return
         self._rebuild()
-        self.window.notice(f"已添加 {entry.name}", "INFO")
+        self.window.notice(f"已添加 {entry.name}（仅保存在本机）", "INFO")
         listing = _listing_from(entry, None)
         self.ping_one(listing)
-        self._report(entry)
 

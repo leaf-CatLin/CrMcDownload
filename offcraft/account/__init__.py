@@ -1,23 +1,26 @@
-"""账户提供者抽象：离线账户的现包装，外置登录的接入位。
-
-本次只交付抽象 + 离线实现 + 启动参数注入位（``-javaagent``、``accessToken``、
-``user_type``）。后续接 LittleSkin / authlib-injector 只需新增一个
-:class:`AccountProvider` 实现并注册到 :func:`get_provider`，界面与启动主链路不改。
+"""账户提供者抽象：离线账户与 Microsoft 正版账户。
 
 :class:`LaunchAccount` 与旧的 :class:`offcraft.launch.auth.OfflineProfile` 字段兼容
 （``name/uuid/access_token/user_type/xuid/auth_session``），command.py 可直接消费。
+
+正版账户的令牌由 :mod:`offcraft.account.store` 保存在本机，启动时不足两分钟过期
+就自动用刷新令牌续期。
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from offcraft.account.microsoft import MicrosoftAuthError, dashed_uuid, refresh_session
+from offcraft.account.store import load_session, save_session
 from offcraft.launch.auth import OfflineProfile, offline_uuid, validate_name
 
 __all__ = [
     "AccountProvider",
     "LaunchAccount",
+    "MicrosoftAccount",
     "OfflineAccount",
     "get_provider",
     "register_provider",
@@ -26,7 +29,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class LaunchAccount:
-    """一次启动所需的账户信息（离线 / 外置登录统一形态）。"""
+    """一次启动所需的账户信息（离线 / 正版统一形态）。"""
 
     name: str
     uuid: str
@@ -58,8 +61,8 @@ class AccountProvider(Protocol):
     id: str
     label: str
 
-    def acquire(self, config: Any) -> LaunchAccount:
-        """从配置里取出/生成本次启动要用的账户。"""
+    def acquire(self, config: Any, data_dir: Any = None) -> LaunchAccount:
+        """从配置 / 本地令牌里取出本次启动要用的账户。"""
         ...
 
     def capabilities(self) -> set[str]:
@@ -73,7 +76,7 @@ class OfflineAccount:
     id = "offline"
     label = "离线账户"
 
-    def acquire(self, config: Any) -> LaunchAccount:
+    def acquire(self, config: Any, data_dir: Any = None) -> LaunchAccount:
         name = validate_name(getattr(config, "username", "") or "Player")
         return LaunchAccount(name=name, uuid=offline_uuid(name))
 
@@ -82,7 +85,35 @@ class OfflineAccount:
         return {"skin"}
 
 
-_PROVIDERS: dict[str, AccountProvider] = {"offline": OfflineAccount()}
+class MicrosoftAccount:
+    """Microsoft 正版账户：使用本地保存的 Minecraft 令牌，必要时自动续期。"""
+
+    id = "microsoft"
+    label = "正版账户"
+
+    def acquire(self, config: Any, data_dir: Any = None) -> LaunchAccount:
+        session = load_session(data_dir)
+        if session is None:
+            raise MicrosoftAuthError("正版账号尚未登录，请点击启动页的账户名完成登录")
+        if time.time() >= session.expires_at - 120:
+            session = refresh_session(session, proxy=getattr(config, "proxy", "") or "")
+            save_session(session, data_dir)
+        return LaunchAccount(
+            name=session.name,
+            uuid=dashed_uuid(session.uuid),
+            access_token=session.access_token,
+            user_type="msa",
+            xuid=session.xuid,
+        )
+
+    def capabilities(self) -> set[str]:
+        return {"skin", "cape", "online-mode-server"}
+
+
+_PROVIDERS: dict[str, AccountProvider] = {
+    "offline": OfflineAccount(),
+    "microsoft": MicrosoftAccount(),
+}
 
 
 def register_provider(provider: AccountProvider) -> None:

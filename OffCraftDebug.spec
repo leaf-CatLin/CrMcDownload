@@ -11,12 +11,12 @@ a = Analysis(
         collect_submodules('PIL')
         + collect_submodules('offcraft.plugins.builtin')
         + collect_submodules('nacl')
-        + ['_cffi_backend']
+        + ['_cffi_backend', 'webview', 'webview.platforms.edgechromium', 'clr', 'clr_loader']
     ),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['paramiko', 'offcraft.p2p'],  # P2P 引擎随插件按需下载（以 offcraft_p2p 提供），基础包不内置
+    excludes=['paramiko', 'offcraft.p2p', 'PyQt5'],  # P2P 引擎随插件按需下载（以 offcraft_p2p 提供），基础包不内置
     noarchive=False,
     optimize=0,
 )

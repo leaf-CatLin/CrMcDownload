@@ -380,6 +380,11 @@ QLabel#brandSub {{ font-size: 8pt; color: {MUTED}; }}
 QLabel#title {{ font-size: 19pt; font-weight: 700; }}
 QLabel#h2 {{ font-size: 13pt; font-weight: 700; }}
 QLabel#h3 {{ font-size: 11pt; font-weight: 600; }}
+QLabel#deviceCode {{
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 18pt;
+    font-weight: 700;
+}}
 QLabel#muted {{ color: {MUTED}; font-size: 9pt; }}
 QLabel#mutedSmall {{ color: {MUTED}; font-size: 8pt; }}
 QLabel#heroName {{ font-size: 20pt; font-weight: 700; }}

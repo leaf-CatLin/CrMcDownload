@@ -22,6 +22,8 @@ if os.path.isfile(_license):
 # 官方内置插件经 importlib 动态导入，静态分析抓不到，须一并收集 offcraft.plugins.builtin；
 # 离线联机（P2P）用 pynacl（libsodium 绑定），收齐 nacl 子模块与其原生库（_sodium.pyd/libsodium.dll）；
 # nacl._sodium 是 cffi 扩展，导入裸 _cffi_backend（不导入 cffi 包，PyInstaller 的 cffi hook 不触发），须显式收它。
+# 正版登录的内嵌 WebView2 窗口由 pywebview 提供（运行时按平台动态导入后端，须显式声明），
+# 其 Windows 后端经 pythonnet（clr）调用系统 WebView2 运行时。
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -36,6 +38,10 @@ a = Analysis(
         *collect_submodules("offcraft.plugins.builtin"),
         *collect_submodules("nacl"),
         "_cffi_backend",
+        "webview",
+        "webview.platforms.edgechromium",
+        "clr",
+        "clr_loader",
     ],
     hookspath=[],
     hooksconfig={},

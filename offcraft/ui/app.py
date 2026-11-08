@@ -21,6 +21,7 @@ import shutil
 import sys
 import threading
 import time
+import webbrowser
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
@@ -61,6 +62,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -92,6 +94,17 @@ from offcraft.content.target import (
 )
 from offcraft.content.modrinth import ModrinthClient, ProjectHit, ProjectVersion
 from offcraft.account import get_provider
+from offcraft.account.microsoft import (
+    MicrosoftAuthError,
+    authenticate,
+    authorize_url,
+    exchange_code,
+    extract_code,
+    poll_device_code,
+    request_device_code,
+)
+from offcraft.account.store import clear_session, load_session, save_session
+from offcraft.account.webview_login import callback_error, spawn_login, wait_result
 from offcraft.instances import (
     Instance,
     discover_instances,
@@ -120,6 +133,7 @@ from offcraft.ui.install_page import InstallPage
 from offcraft.ui.spinner import Spinner
 from offcraft.ui.style import LineStyle
 from offcraft.ui.online_page import OnlinePage
+from offcraft.ui.privacy import PrivacyDialog
 from offcraft.ui.skin_page import LAYOUT_CHOICES, SkinPage
 from offcraft.ui.theme import (
     ACCENT,
@@ -452,36 +466,379 @@ class SourceDialog(QDialog):
 
 
 class AccountDialog(QDialog):
-    """离线账户：只影响游戏内显示的用户名。"""
+    """账户中心：离线账户改名，或登录 Microsoft 正版账号。"""
 
-    def __init__(self, parent: QWidget, name: str) -> None:
+    device_prompt = pyqtSignal(str, str)
+    login_note = pyqtSignal(str)
+    login_done = pyqtSignal(object)
+    login_failed = pyqtSignal(str)
+    #: 结束忙碌状态但不算失败（用户关闭窗口 / 取消授权）
+    login_reset = pyqtSignal(str)
+    #: 内嵌窗口不可用，降级到系统浏览器 + 手动粘贴
+    browser_fallback = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget, config: Config, data_dir: str | Path | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("离线账户")
-        self.setMinimumWidth(400)
+        self.config = config
+        self.data_dir = data_dir
+        self.session = load_session(data_dir)
+        self._alive = True
+        self._cancel = threading.Event()
+        self._login_proc: Any = None
+        self._device_code = ""
+        self.setWindowTitle("账户")
+        self.setMinimumWidth(460)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(10)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # ------------------------------------------------ 离线账户
+        offline = QWidget()
+        offline_layout = QVBoxLayout(offline)
+        offline_layout.setContentsMargins(4, 10, 4, 4)
+        offline_layout.setSpacing(8)
         hint = QLabel("离线账户无需登录，用户名会作为游戏内昵称（3-16 位字母 / 数字 / 下划线）。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
-        self.edit = QLineEdit(name)
+        offline_layout.addWidget(hint)
+        self.edit = QLineEdit(config.username)
         self.edit.setMaxLength(16)
         self.edit.selectAll()
-        layout.addWidget(self.edit)
+        offline_layout.addWidget(self.edit)
+        offline_layout.addStretch(1)
+        self.tabs.addTab(offline, "离线账户")
+
+        # ------------------------------------------------ 正版账户
+        msa = QWidget()
+        msa_layout = QVBoxLayout(msa)
+        msa_layout.setContentsMargins(4, 10, 4, 4)
+        msa_layout.setSpacing(8)
+        self.msa_status = QLabel()
+        self.msa_status.setObjectName("h2")
+        self.msa_status.setWordWrap(True)
+        msa_layout.addWidget(self.msa_status)
+        self.msa_note = QLabel()
+        self.msa_note.setObjectName("muted")
+        self.msa_note.setWordWrap(True)
+        msa_layout.addWidget(self.msa_note)
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.device_button = QPushButton("设备码登录")
+        self.device_button.setToolTip("显示一个 8 位代码，在任意浏览器里输入即可完成登录")
+        self.device_button.clicked.connect(self._login_device)
+        buttons.addWidget(self.device_button)
+        self.browser_button = QPushButton("浏览器登录")
+        self.browser_button.setToolTip("在启动器内弹出登录窗口，完成登录后自动继续")
+        self.browser_button.clicked.connect(self._login_browser)
+        buttons.addWidget(self.browser_button)
+        self.manual_button = QPushButton("手动粘贴")
+        self.manual_button.setToolTip("内嵌窗口不可用时的备用方式：用系统浏览器登录后粘贴跳转地址")
+        self.manual_button.clicked.connect(self._login_manual)
+        buttons.addWidget(self.manual_button)
+        self.logout_button = QPushButton("退出正版登录")
+        self.logout_button.setObjectName("ghost")
+        self.logout_button.clicked.connect(self._logout)
+        buttons.addWidget(self.logout_button)
         buttons.addStretch(1)
+        msa_layout.addLayout(buttons)
+
+        # 设备码：醒目显示代码并配「复制代码」按钮（不自动占用剪贴板）
+        self.device_row = QWidget()
+        device_layout = QHBoxLayout(self.device_row)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_layout.setSpacing(10)
+        self.device_code_label = QLabel()
+        self.device_code_label.setObjectName("deviceCode")
+        self.device_code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        device_layout.addWidget(self.device_code_label)
+        self.copy_code_button = QPushButton("复制代码")
+        self.copy_code_button.setToolTip("把上方设备码复制到剪贴板")
+        self.copy_code_button.clicked.connect(self._copy_device_code)
+        device_layout.addWidget(self.copy_code_button)
+        device_layout.addStretch(1)
+        self.device_row.setVisible(False)
+        msa_layout.addWidget(self.device_row)
+
+        # 浏览器登录：微软不再回调到 localhost，改为粘贴跳转地址
+        self.paste_row = QWidget()
+        paste_layout = QHBoxLayout(self.paste_row)
+        paste_layout.setContentsMargins(0, 0, 0, 0)
+        paste_layout.setSpacing(6)
+        self.paste_edit = QLineEdit()
+        self.paste_edit.setPlaceholderText("粘贴浏览器地址栏里的完整地址（含 code=）")
+        paste_layout.addWidget(self.paste_edit)
+        self.paste_button = QPushButton("完成登录")
+        self.paste_button.clicked.connect(self._finish_browser)
+        paste_layout.addWidget(self.paste_button)
+        self.paste_row.setVisible(False)
+        msa_layout.addWidget(self.paste_row)
+
+        msa_layout.addStretch(1)
+        self.tabs.addTab(msa, "正版账户")
+
+        # ------------------------------------------------ 底部按钮
+        footer = QHBoxLayout()
+        footer.addStretch(1)
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
-        buttons.addWidget(cancel)
+        footer.addWidget(cancel)
         ok = QPushButton("保存")
         ok.setObjectName("accent")
-        ok.clicked.connect(self.accept)
-        buttons.addWidget(ok)
-        layout.addLayout(buttons)
+        ok.clicked.connect(self._save)
+        footer.addWidget(ok)
+        layout.addLayout(footer)
 
-    def value(self) -> str:
-        return self.edit.text().strip()
+        self.device_prompt.connect(self._on_device_prompt)
+        self.login_note.connect(self.msa_note.setText)
+        self.login_done.connect(self._on_login_done)
+        self.login_failed.connect(self._on_login_failed)
+        self.login_reset.connect(self._on_login_reset)
+        self.browser_fallback.connect(self._on_browser_fallback)
+
+        if config.account_provider == "microsoft":
+            self.tabs.setCurrentIndex(1)
+        self._refresh_msa()
+
+    # ------------------------------------------------------------- 状态
+    def done(self, result: int) -> None:  # noqa: D401 - Qt 回调
+        self._alive = False
+        self._cancel.set()
+        proc = self._login_proc
+        self._login_proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        super().done(result)
+
+    def _refresh_msa(self) -> None:
+        session = self.session
+        busy = not self.device_button.isEnabled()
+        self._hide_device_code()
+        if session is None:
+            self.msa_status.setText("尚未登录正版账号")
+            if not busy:
+                self.msa_note.setText(
+                    "登录后启动游戏会自动携带正版令牌。需要能访问微软服务，"
+                    "且该账户已购买 Minecraft: Java 版。"
+                )
+            self.device_button.setVisible(True)
+            self.browser_button.setVisible(True)
+            self.manual_button.setVisible(True)
+            self.logout_button.setVisible(False)
+        else:
+            self.msa_status.setText(f"已登录：{session.name}")
+            if not busy:
+                self.msa_note.setText("登录信息只保存在本机，退出登录会立即删除。")
+            self.device_button.setVisible(False)
+            self.browser_button.setVisible(False)
+            self.manual_button.setVisible(False)
+            self.logout_button.setVisible(True)
+            self.paste_row.setVisible(False)
+
+    def _busy(self, busy: bool, text: str = "") -> None:
+        self.device_button.setEnabled(not busy)
+        self.browser_button.setEnabled(not busy)
+        self.manual_button.setEnabled(not busy)
+        self.logout_button.setEnabled(not busy)
+        self.paste_button.setEnabled(not busy)
+        if text:
+            self.msa_note.setText(text)
+
+    # ------------------------------------------------------------- 设备码
+    def _login_device(self) -> None:
+        self._hide_device_code()
+        self._busy(True, "正在向微软申请登录代码……")
+        threading.Thread(
+            target=self._device_worker, args=(self.config.proxy or "",), daemon=True
+        ).start()
+
+    def _device_worker(self, proxy: str) -> None:
+        try:
+            code = request_device_code(proxy=proxy)
+            if not self._alive:
+                return
+            self.device_prompt.emit(code.verification_uri, code.user_code)
+            token = poll_device_code(
+                code,
+                proxy=proxy,
+                cancel=self._cancel,
+                on_wait=lambda left: self.login_note.emit(f"等待你在浏览器中完成登录……剩余 {left} 秒"),
+            )
+            session = authenticate(token, proxy=proxy)
+            if self._alive:
+                self.login_done.emit(session)
+        except Exception as exc:  # noqa: BLE001 - 统一展示给用户
+            if self._alive:
+                self.login_failed.emit(str(exc))
+
+    def _on_device_prompt(self, url: str, code: str) -> None:
+        self._device_code = code
+        self.device_code_label.setText(code)
+        self.device_row.setVisible(True)
+        self.msa_note.setText(
+            f"已打开 {url}，请在页面中输入下方代码完成登录，完成后会自动继续。"
+        )
+        webbrowser.open(url)
+
+    def _copy_device_code(self) -> None:
+        if not self._device_code:
+            return
+        QApplication.clipboard().setText(self._device_code)
+        self.msa_note.setText(f"代码 {self._device_code} 已复制到剪贴板，粘贴到浏览器即可。")
+
+    def _hide_device_code(self) -> None:
+        self._device_code = ""
+        self.device_code_label.clear()
+        self.device_row.setVisible(False)
+
+    # ------------------------------------------------------------- 浏览器
+    def _login_browser(self) -> None:
+        """在子进程内嵌 WebView2 打开登录页，自动截获跳转地址（PCL 的做法）。"""
+        self._hide_device_code()
+        url = authorize_url()
+        try:
+            proc, path = spawn_login(url)
+        except OSError as exc:
+            self._login_manual(f"内嵌登录窗口启动失败：{exc}，已改用系统浏览器。")
+            return
+        self._login_proc = proc
+        self._busy(True, "已打开登录窗口，请在窗口内完成 Microsoft 登录，完成后会自动继续。")
+        threading.Thread(
+            target=self._embedded_worker,
+            args=(proc, path, self.config.proxy or ""),
+            daemon=True,
+        ).start()
+
+    def _embedded_worker(self, proc: Any, path: Any, proxy: str) -> None:
+        data = None
+        try:
+            data = wait_result(proc, path, cancel=self._cancel)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if not self._alive:
+            return
+        if data is None or data.get("cancelled"):
+            self.login_reset.emit("已关闭登录窗口，未完成登录。")
+            return
+        if data.get("error"):
+            self.browser_fallback.emit(str(data["error"]))
+            return
+        url = str(data.get("url") or "")
+        denied = callback_error(url)
+        if denied:
+            self.login_reset.emit(denied)
+            return
+        try:
+            code = extract_code(url)
+        except MicrosoftAuthError as exc:
+            self.login_reset.emit(str(exc))
+            return
+        self.login_note.emit("正在用授权码换取登录令牌……")
+        self._browser_worker(code, proxy)
+
+    def _login_manual(self, message: str = "") -> None:
+        """备用方式：系统浏览器 + 粘贴跳转地址。"""
+        self._hide_device_code()
+        url = authorize_url()
+        webbrowser.open(url)
+        self.paste_edit.clear()
+        self.paste_row.setVisible(True)
+        self.paste_edit.setFocus()
+        self.msa_note.setText(
+            message
+            or "已在浏览器打开登录页。完成登录后地址栏会跳到 login.live.com/oauth20_desktop.srf"
+            "（其中含 code=），把整条地址复制粘贴到下方，再点「完成登录」。"
+        )
+
+    def _finish_browser(self) -> None:
+        try:
+            code = extract_code(self.paste_edit.text())
+        except MicrosoftAuthError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self._busy(True, "正在用授权码换取登录令牌……")
+        threading.Thread(
+            target=self._browser_worker, args=(code, self.config.proxy or ""), daemon=True
+        ).start()
+
+    def _browser_worker(self, code: str, proxy: str) -> None:
+        try:
+            token = exchange_code(code, proxy=proxy)
+            session = authenticate(token, proxy=proxy)
+            if self._alive:
+                self.login_done.emit(session)
+        except Exception as exc:  # noqa: BLE001 - 统一展示给用户
+            if self._alive:
+                self.login_failed.emit(str(exc))
+
+    def _on_login_reset(self, message: str) -> None:
+        self._busy(False, message)
+
+    def _on_browser_fallback(self, error: str) -> None:
+        self._busy(False)
+        self._login_manual(f"{error} 已改用系统浏览器，登录后把跳转地址粘贴回来。")
+
+    # ------------------------------------------------------------- 结果
+    def _on_login_done(self, session: object) -> None:
+        try:
+            save_session(session, self.data_dir)  # type: ignore[arg-type]
+        except OSError as exc:
+            self._on_login_failed(f"登录信息保存失败：{exc}")
+            return
+        self.session = session  # type: ignore[assignment]
+        self.config.account_provider = "microsoft"
+        save_config(self.config, self.data_dir)
+        self._busy(False, f"已登录：{self.session.name}")
+        self.accept()
+
+    def _on_login_failed(self, message: str) -> None:
+        self._busy(False)
+        self._refresh_msa()
+        QMessageBox.warning(self, "正版登录失败", message)
+
+    def _logout(self) -> None:
+        answer = QMessageBox.question(self, APP_NAME, "确定退出正版登录？本地令牌会被删除。")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        clear_session(self.data_dir)
+        self.session = None
+        self.config.account_provider = "offline"
+        save_config(self.config, self.data_dir)
+        self._refresh_msa()
+
+    # ------------------------------------------------------------- 保存
+    def _save(self) -> None:
+        if self.tabs.currentIndex() == 0:
+            try:
+                name = validate_name(self.edit.text().strip())
+            except ValueError as exc:
+                QMessageBox.warning(self, APP_NAME, str(exc))
+                return
+            self.config.username = name
+            self.config.account_provider = "offline"
+            save_config(self.config, self.data_dir)
+            self.accept()
+            return
+        if self.session is None:
+            QMessageBox.warning(self, APP_NAME, "请先完成正版登录（设备码或浏览器登录）。")
+            return
+        self.config.account_provider = "microsoft"
+        save_config(self.config, self.data_dir)
+        self.accept()
 
 
 class LoaderPickDialog(QDialog):
@@ -1146,7 +1503,7 @@ class MainWindow(QMainWindow):
 
         self.avatar = QLabel()
         self.avatar.setFixedSize(AVATAR_PX, AVATAR_PX)
-        self.avatar.setPixmap(self._avatar_pixmap(self.config.username, AVATAR_PX))
+        self.avatar.setPixmap(self._avatar_pixmap(self._account_display_name(), AVATAR_PX))
         avatar_row = QHBoxLayout()
         avatar_row.setContentsMargins(0, 0, 0, 0)
         avatar_row.addStretch(1)
@@ -1154,17 +1511,30 @@ class MainWindow(QMainWindow):
         avatar_row.addStretch(1)
         panel.add_layout(avatar_row)
 
-        caption = self._label("离线账户", "mutedSmall")
-        caption.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        caption = QPushButton(self._account_caption())
+        caption.setObjectName("accountSwitch")
+        caption.setFlat(True)
+        caption.setCursor(Qt.CursorShape.PointingHandCursor)
+        caption.setToolTip("切换离线账户 / 登录 Microsoft 正版账号")
+        caption.setStyleSheet(
+            "QPushButton#accountSwitch { border: none; background: transparent;"
+            f" color: {MUTED}; font-size: 8pt; padding: 2px 4px; }}"
+            "QPushButton#accountSwitch:hover { color: #2F6FD0; text-decoration: underline; }"
+        )
+        caption.clicked.connect(self._open_account_dialog)
+        self.account_switch = caption
         panel.add(caption)
 
-        self.account_name = QLineEdit(self.config.username)
+        self.account_name = QLineEdit(self._account_display_name())
         self.account_name.setObjectName("heroName")
         self.account_name.setFixedHeight(u(2.5))
         self.account_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.account_name.setMaxLength(16)
         self.account_name.setToolTip("离线账户名：点击即可修改，回车生效")
         self.account_name.editingFinished.connect(self._apply_account_name)
+        if self.config.account_provider == "microsoft":
+            self.account_name.setReadOnly(True)
+            self.account_name.setToolTip("正版账户名由 Microsoft 提供，点上方账户标签可切换账户")
         panel.add(self.account_name)
 
         daily = QFrame()
@@ -2410,6 +2780,23 @@ class MainWindow(QMainWindow):
         java.add(self.settings_jvm)
         layout.addWidget(java)
 
+        account = Card()
+        account.add(self._label("账户", "h2"))
+        self.settings_account_label = self._label(self._account_caption())
+        self.settings_account_label.setWordWrap(True)
+        account.add(self.settings_account_label)
+        account_hint = self._label(
+            "正版登录使用 Microsoft 账户（需已购买 Minecraft: Java 版），"
+            "登录令牌只保存在本机；也可以随时切回离线账户。"
+        )
+        account_hint.setWordWrap(True)
+        account.add(account_hint)
+        switch_account = QPushButton("登录 / 切换账户")
+        switch_account.setCursor(Qt.CursorShape.PointingHandCursor)
+        switch_account.clicked.connect(self._open_account_dialog)
+        account.add(switch_account)
+        layout.addWidget(account)
+
         download = Card()
         download.add(self._label("下载", "h2"))
         # 下载源地址 / 令牌 / 代理不在界面上展示（只能按 F12 打开设置窗口改），
@@ -2484,6 +2871,11 @@ class MainWindow(QMainWindow):
         open_data.clicked.connect(self._open_data_dir)
         about_row.addWidget(open_data)
         open_data.setCursor(Qt.CursorShape.PointingHandCursor)
+        privacy = QPushButton("隐私政策")
+        privacy.setToolTip("查看数据收集与存储说明：你添加的服务器只保存在本机，不会自动上传。")
+        privacy.setCursor(Qt.CursorShape.PointingHandCursor)
+        privacy.clicked.connect(lambda: PrivacyDialog(self).exec())
+        about_row.addWidget(privacy)
         easter = QPushButton("千万别点")
         easter.setObjectName("ghost")
         easter.setToolTip("真的别点。")
@@ -2899,8 +3291,58 @@ class MainWindow(QMainWindow):
         self.notice(f"已删除实例 {instance.id}", "WARN")
         self.refresh_instances()
 
+    def _account_caption(self) -> str:
+        """启动页账户标签：离线 / 正版（未登录时也明确提示）。"""
+        if self.config.account_provider == "microsoft":
+            session = load_session(self.data_dir)
+            return f"正版账户 · {session.name}" if session else "正版账户（未登录）"
+        return "离线账户"
+
+    def _account_display_name(self) -> str:
+        if self.config.account_provider == "microsoft":
+            session = load_session(self.data_dir)
+            return session.name if session else "未登录"
+        return self.config.username
+
+    def _refresh_account_ui(self) -> None:
+        """登录 / 退出 / 改名后同步启动页与设置页的账户信息。"""
+        name = self._account_display_name()
+        online = self.config.account_provider == "microsoft" and load_session(self.data_dir) is not None
+        if hasattr(self, "account_name"):
+            self.account_name.setText(name)
+            self.account_name.setReadOnly(online)
+            self.account_name.setToolTip(
+                "正版账户名由 Microsoft 提供，点上方账户标签可切换账户"
+                if online
+                else "离线账户名：点击即可修改，回车生效"
+            )
+        if hasattr(self, "account_switch"):
+            self.account_switch.setText(self._account_caption())
+        if hasattr(self, "avatar"):
+            self.avatar.setPixmap(self._avatar_pixmap(name, AVATAR_PX))
+        if hasattr(self, "settings_account_label"):
+            self.settings_account_label.setText(self._account_caption())
+
+    def _open_account_dialog(self) -> None:
+        """账户中心：离线改名 / 正版登录 / 退出登录。"""
+        previous = self._account_caption()
+        dialog = AccountDialog(self, self.config, self.data_dir)
+        # 持有引用：登录线程可能还在收尾，避免对话框对象提前释放
+        self._account_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._account_dialog = None
+        self._refresh_account_ui()
+        current = self._account_caption()
+        if current != previous:
+            self.notice(f"当前账户：{current}")
+
     def _apply_account_name(self) -> None:
-        """名称框回车：校验后保存并刷新头像。"""
+        """名称框回车：校验后保存并刷新头像。正版账户名不可改。"""
+        if self.config.account_provider == "microsoft":
+            self.account_name.setText(self._account_display_name())
+            return
         name = self.account_name.text().strip()
         if name == self.config.username:
             self.account_name.setText(self.config.username)
@@ -2953,7 +3395,7 @@ class MainWindow(QMainWindow):
         def worker(cancel: threading.Event) -> str:
             t_load = time.perf_counter()
             version = load_version(game_dir, instance.id)
-            profile = get_provider(self.config).acquire(self.config)
+            profile = get_provider(self.config).acquire(self.config, self.data_dir)
             load_ms = (time.perf_counter() - t_load) * 1000
             plan = self._build_command_with_repair(
                 version, game_dir, profile, options, cancel
