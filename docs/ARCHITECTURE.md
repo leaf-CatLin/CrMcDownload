@@ -240,7 +240,17 @@ offcraft/plugins/
   仍随基础包保留（hiddenimports 不动），只按需下载纯代码——满足「功能选择性下载」，暂不省体积。
 - **房间语义**：`房间码+预共享密钥` → `房间名(全局唯一、不区分大小写)+密码`；生命周期
   `创建`(服务端登记，全局唯一名 + 每设备现存<10) / `开放`(房主开实时会话) / `加入`(仅连已开放会话，
-  绝不自动建房) / `删除`(房主删，释放名额)。
+  绝不自动建房) / `删除`(房主删，释放名额)。表单仅收房间名+密码；转发端口默认 25565、不可用时从
+  游戏 `logs/latest.log` 探测(`p2p/port_probe.py`)。
+- **房主控制面 `host_secret`**：端到端模型下 `open()` 会把 `host_sid` 下发给**所有加入者**，故 `host_sid`
+  不足以单独授权踢人。`开放` 时服务端另随机生成 `host_secret=token_hex(32)`、**仅回给房主、不进名册**；
+  `kick` 服务端以 `hmac.compare_digest` 校验 `host_secret` 且 `sid==host_sid`（否则 403），并调
+  `RelayServer.evict()` 按 `(room,sid)` 登记跨线程关闭桥接两端 writer、撤销命中该 sid 的在途配对令牌，
+  将被踢者加入 `room.blocked`（`join`/`relay` 一律拒绝其旧 sid），同时把该成员稳定的
+  `p2p_device_id` 写入 `room.blocked_devices`——**同一设备换新 sid / 新公钥也无法重新加入**，
+  封禁随 `删除` / 重开房间或房主 `rekey` 清空。`rekey` 由房主提交新的 `auth_key`（密码只在本地派生），
+  服务端原子替换后 `evict` 所有非房主成员并清空封禁，旧成员不知道新密码即无法回流；`roster` / `kick`
+  仍要求 `sid == host_sid` + `host_secret`（403 兜底）。`roster` 供房主/成员拉取在线名册。
 - **机器绑定存储**：加入成功后把房间名+密码经 **Windows DPAPI**（per-user+per-machine，`CryptProtectData`）
   加密存本地，非 Windows/失败回落首启随机 `machine.key` + `SecretBox`（见 `p2p/vault.py`）。**局限**：
   同账户同机可还原明文；重装/清配置会重置 `p2p_device_id`（配额与设备身份均为软约束）。设备身份与

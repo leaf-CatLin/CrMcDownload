@@ -144,7 +144,12 @@
   按需下载、逐文件 sha256 校验后加载；**入口只在「插件」页一张专用卡片**（下载 → 启用 → 进入），不加顶层导航，
   第三方动态加载始终禁止。房间语义由 `房间码+预共享密钥` 改为 **`房间名`（全局唯一、不区分大小写）+ `密码`**，
   生命周期 `创建`（服务端登记，每设备最多 10 个）/ `开放`（房主开实时会话）/ `加入`（仅连已开放会话，绝不自动建房）/
-  `删除`（房主删、释放名额）；设备身份 = 客户端首启稳定随机 `p2p_device_id`（软约束）。加入成功后把房间名+密码经
+  `删除`（房主删、释放名额）；表单只填 **`房间名` + `密码`**（不再有世界/端口输入，转发端口默认 25565、不可用时从游戏
+  `logs/latest.log` 自动探测）。**房主权限管理**：`开放` 时服务端随机下发 `host_secret`（仅房主持有、不进名册），房主可
+  `roster` 查看在线成员、`kick` 踢出指定成员（服务端校验 `host_secret`+`host_sid`，并经中继即时拆桥 + 撤销在途配对令牌）；
+  踢出为「断开当前会话」而非永久封禁——被踢者若仍持有密码可重新 `加入`（阻断重加入需改密码，为已知局限）。面板同时展示
+  `已进入的房间`（本机加密存）与 `所在房间`（当前会话），房主可对本机已存记录 `查看密码`。设备身份 = 客户端首启稳定随机
+  `p2p_device_id`（软约束）。加入成功后把房间名+密码经
   **Windows DPAPI**（per-user+per-machine）加密存本地，非 Windows/失败回落首启随机 `machine.key`；同账户同机可还原
   明文、重装会重置设备 id 为已知局限。UI 全程不暴露 `mc.yjlt.top`/中继地址，准入仍靠 `proof` HMAC。
 - **Web 可视化看板**：`server/page`（Vue 3 + Vite + vue-router，仅这两个运行时依赖、图表自绘 SVG）的构建产物
@@ -180,7 +185,8 @@ curl http://127.0.0.1:8081/health
 `/modrinth` `/modcdn`，另带 `/health` 与 `/metrics`；0.6.0 新增 `/api/servers/*`、`/api/stats/*`、`/api/skins/status`
 （联机榜单与看板数据，读接口免令牌）、`/skin/<name>.png`（皮肤托管）、`/page`（Web 看板静态资源），
 以及 `/plugin/offline-multiplayer.{manifest.json,zip}`（离线联机特权插件按需下载，免令牌、只读、防路径穿越，
-文件由 `devtools/build_mp_plugin.py` 产出到 `MIRROR_PLUGIN_DIR`）。`/p2p/*` 为中继信令控制面（数据面走独立 TCP 中继端口）。
+文件由 `devtools/build_mp_plugin.py` 产出到 `MIRROR_PLUGIN_DIR`）。`/p2p/*` 为中继信令控制面（数据面走独立 TCP 中继端口），
+含 `create/list/delete/open/join/leave/announce/relay` 及房主控制面 `roster`（查在线成员）与 `kick`（凭 `host_secret` 踢人）。
 带查询串的请求（如 Modrinth 搜索）会完整转发并以 `.q<sha1>` 区分缓存；
 maven 路由下的 `*.xml` 索引按元数据 TTL 缓存，jar 长期缓存。
 
