@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 import threading
@@ -21,7 +22,7 @@ from typing import Any, Iterable
 
 __all__ = ["Database", "SCHEMA_VERSION"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: 热度里「近 24h 平均在线」的统计窗口（秒）
 _ONLINE_WINDOW = 24 * 3600
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS servers (
     label     TEXT    NOT NULL DEFAULT '',
     source    TEXT    NOT NULL DEFAULT 'builtin',   -- builtin|user|api
     added_by  TEXT    NOT NULL DEFAULT '',
+    owner_hash TEXT   NOT NULL DEFAULT '',           -- 上报者管理密钥（SHA-256），仅用于修改/上下架/删除
     enabled   INTEGER NOT NULL DEFAULT 1,
     reports   INTEGER NOT NULL DEFAULT 0,
     last_seen REAL    NOT NULL DEFAULT 0,
@@ -120,6 +122,16 @@ class Database:
             current = int(row["version"]) if row else 0
             if current < SCHEMA_VERSION:
                 self._conn.executescript(_SCHEMA)
+                # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里显式加列
+                if 0 < current < 4:
+                    columns = {
+                        str(row["name"])
+                        for row in self._conn.execute("PRAGMA table_info(servers)")
+                    }
+                    if "owner_hash" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE servers ADD COLUMN owner_hash TEXT NOT NULL DEFAULT ''"
+                        )
                 if current == 0:
                     self._conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
                 else:
@@ -177,27 +189,112 @@ class Database:
             )
             self._conn.commit()
 
-    def report(self, host: str, port: int, label: str = "", added_by: str = "") -> None:
-        """用户上报一个新服务器：不存在则插入（source=user），存在则热度 +1。"""
+    def report(
+        self, host: str, port: int, label: str = "", added_by: str = "", owner_hash: str = ""
+    ) -> str:
+        """用户上报服务器。
+
+        返回 ``"created"``（新建，且本次调用者就是管理员）/ ``"owned"``（本人重复上报，
+        只更新备注）/ ``"exists"``（别人已收录，仅累加热度）。``owner_hash`` 是管理密钥的
+        SHA-256，仅用于后续修改 / 上下架 / 删除鉴权，不对外返回。
+        """
         host = str(host or "").strip().lower()
+        owner_hash = str(owner_hash or "").strip()
         now = time.time()
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT 1 FROM servers WHERE host=? AND port=?", (host, int(port))
-            )
-            if cur.fetchone():
+            row = self._conn.execute(
+                "SELECT owner_hash FROM servers WHERE host=? AND port=?", (host, int(port))
+            ).fetchone()
+            if row is not None:
+                stored = str(row["owner_hash"] or "")
+                if owner_hash and stored and hmac.compare_digest(stored, owner_hash):
+                    self._conn.execute(
+                        "UPDATE servers SET label=?, last_seen=? WHERE host=? AND port=?",
+                        (str(label or "").strip(), now, host, int(port)),
+                    )
+                    self._conn.commit()
+                    return "owned"
                 self._conn.execute(
                     "UPDATE servers SET reports = reports + 1, last_seen = ?, "
                     "label = CASE WHEN label='' THEN ? ELSE label END WHERE host=? AND port=?",
                     (now, str(label or "").strip(), host, int(port)),
                 )
-            else:
-                self._conn.execute(
-                    "INSERT INTO servers(host, port, label, source, added_by, enabled, reports, last_seen)"
-                    " VALUES (?,?,?,'user',?,1,1,?)",
-                    (host, int(port), str(label or "").strip(), str(added_by or "")[:64], now),
-                )
+                self._conn.commit()
+                return "exists"
+            self._conn.execute(
+                "INSERT INTO servers(host, port, label, source, added_by, owner_hash, enabled, reports, last_seen)"
+                " VALUES (?,?,?,'user',?,?,1,1,?)",
+                (
+                    host,
+                    int(port),
+                    str(label or "").strip(),
+                    str(added_by or "")[:64],
+                    owner_hash,
+                    now,
+                ),
+            )
             self._conn.commit()
+            return "created"
+
+    def _owned(self, host: str, port: int, owner_hash: str) -> bool:
+        """记录是否存在且管理密钥匹配（调用方需已持锁）。"""
+        owner_hash = str(owner_hash or "").strip()
+        if not owner_hash:
+            return False
+        row = self._conn.execute(
+            "SELECT owner_hash FROM servers WHERE host=? AND port=?", (host, int(port))
+        ).fetchone()
+        if row is None:
+            return False
+        stored = str(row["owner_hash"] or "")
+        return bool(stored) and hmac.compare_digest(stored, owner_hash)
+
+    def update_owned(self, host: str, port: int, label: str, owner_hash: str) -> bool:
+        """修改自己上报的服务器备注；没有权限返回 ``False``。"""
+        host = str(host or "").strip().lower()
+        with self._lock:
+            if not self._owned(host, port, owner_hash):
+                return False
+            self._conn.execute(
+                "UPDATE servers SET label=? WHERE host=? AND port=?",
+                (str(label or "").strip()[:40], host, int(port)),
+            )
+            self._conn.commit()
+            return True
+
+    def set_visible_owned(self, host: str, port: int, enabled: bool, owner_hash: str) -> bool:
+        """上架 / 下架自己上报的服务器；没有权限返回 ``False``。"""
+        host = str(host or "").strip().lower()
+        with self._lock:
+            if not self._owned(host, port, owner_hash):
+                return False
+            self._conn.execute(
+                "UPDATE servers SET enabled=? WHERE host=? AND port=?",
+                (1 if enabled else 0, host, int(port)),
+            )
+            self._conn.commit()
+            return True
+
+    def delete_owned(self, host: str, port: int, owner_hash: str) -> bool:
+        """删除自己上报的服务器及其探测数据；没有权限返回 ``False``。"""
+        host = str(host or "").strip().lower()
+        with self._lock:
+            if not self._owned(host, port, owner_hash):
+                return False
+            self._conn.execute("DELETE FROM servers WHERE host=? AND port=?", (host, int(port)))
+            self._conn.execute("DELETE FROM servers_state WHERE host=? AND port=?", (host, int(port)))
+            self._conn.execute("DELETE FROM ping_history WHERE host=? AND port=?", (host, int(port)))
+            self._conn.commit()
+            return True
+
+    def enabled_state(self, host: str, port: int) -> bool | None:
+        """服务器当前是否上架；不存在返回 ``None``。"""
+        host = str(host or "").strip().lower()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT enabled FROM servers WHERE host=? AND port=?", (host, int(port))
+            ).fetchone()
+        return None if row is None else bool(row["enabled"])
 
     def set_enabled(self, host: str, port: int, enabled: bool) -> None:
         host = str(host or "").strip().lower()

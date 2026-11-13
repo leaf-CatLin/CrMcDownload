@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,6 +163,12 @@ class ApiRouter:
         if method not in ("GET", "HEAD"):
             if path == "/api/servers/report" and method == "POST":
                 return self._report(body, headers)
+            if path == "/api/servers/update" and method == "POST":
+                return self._owned_action(body, headers, "update")
+            if path == "/api/servers/visibility" and method == "POST":
+                return self._owned_action(body, headers, "visibility")
+            if path == "/api/servers/delete" and method == "POST":
+                return self._owned_action(body, headers, "delete")
             return _err(405, "方法不允许")
         if path == "/api/update":
             # 更新查询本身永远放行，老客户端靠它拿到强制更新信息
@@ -234,8 +241,45 @@ class ApiRouter:
         label = str(payload.get("label") or "")[:40]
         if not self._allow_report(host):
             return _err(429, "上报过于频繁，请稍后再试")
-        self.db.report(host, port, label=label)
-        return _json(200, {"ok": True})
+        status = self.db.report(
+            host, port, label=label, owner_hash=self._key_hash(payload.get("owner"))
+        )
+        return _json(200, {"ok": True, "owned": status != "exists", "status": status})
+
+    @staticmethod
+    def _key_hash(raw: Any) -> str:
+        """把客户端持有的管理密钥变成入库用的 SHA-256。"""
+        text = str(raw or "").strip()
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+    def _owned_action(self, body, headers: dict[str, str], action: str):
+        """修改 / 上下架 / 删除自己上报的服务器（凭上报时登记的管理密钥）。"""
+        if not self._authorized(headers):
+            return _err(403, "需要访问令牌")
+        payload = _decode_json(body)
+        if payload is None:
+            return _err(400, "请求体不是合法 JSON")
+        host = str(payload.get("host") or "")
+        try:
+            host, port = parse_host_port(f"{host}:{payload.get('port') or 25565}")
+        except ServerAddressError as exc:
+            return _err(400, str(exc))
+        owner_hash = self._key_hash(payload.get("owner"))
+        if action == "update":
+            ok = self.db.update_owned(
+                host, port, str(payload.get("label") or ""), owner_hash
+            )
+            message = "已更新服务器信息"
+        elif action == "visibility":
+            visible = bool(payload.get("visible", True))
+            ok = self.db.set_visible_owned(host, port, visible, owner_hash)
+            message = "已上架" if visible else "已下架"
+        else:
+            ok = self.db.delete_owned(host, port, owner_hash)
+            message = "已删除"
+        if not ok:
+            return _err(403, "没有该服务器的管理权限")
+        return _json(200, {"ok": True, "message": message})
 
     def _complaint(self, body, headers: dict[str, str]):
         """``POST /api/servers/complaints``：用户手动举报服务器，只入库待审核。"""
