@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import string
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,9 +14,11 @@ __all__ = [
     "detect_loader",
     "discover_instances",
     "instance_game_dir",
+    "looks_like_minecraft_root",
     "read_pack_metadata",
     "rename_instance",
     "safe_instance_id",
+    "scan_minecraft_dirs",
 ]
 
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+)+")
@@ -33,6 +37,8 @@ class Instance:
     size_bytes: int
     mtime: float
     broken: str | None = None
+    #: 该实例所在的 .minecraft 根目录；空 = 当前配置的游戏目录
+    root: str = ""
 
     @property
     def display_name(self) -> str:
@@ -124,6 +130,111 @@ def discover_instances(mc_dir: Path | str) -> list[Instance]:
         )
     result.sort(key=lambda item: item.mtime, reverse=True)
     return result
+
+
+def looks_like_minecraft_root(path: Path | str) -> bool:
+    """目录是否是 ``.minecraft`` 根：``versions`` 下至少有一个可读版本 JSON。"""
+    versions = Path(path) / "versions"
+    if not versions.is_dir():
+        return False
+    try:
+        for folder in versions.iterdir():
+            if folder.is_dir() and (folder / f"{folder.name}.json").is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+#: 扫描时整棵跳过的系统 / 缓存目录名（小写）
+_SKIP_DIR_NAMES = {
+    "windows",
+    "winsxs",
+    "system32",
+    "syswow64",
+    "system volume information",
+    "$recycle.bin",
+    "recovery",
+    "perflogs",
+    "programdata",
+    "program files",
+    "program files (x86)",
+    "node_modules",
+    ".git",
+    ".svn",
+    "__pycache__",
+    "temp",
+    "tmp",
+}
+
+
+def _norm(path: Path) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(str(path)))
+    except OSError:  # pragma: no cover - 极端路径
+        return str(path).lower()
+
+
+def _drive_roots():
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            candidate = Path(f"{letter}:\\")
+            try:
+                if candidate.is_dir():
+                    yield candidate
+            except OSError:
+                continue
+    else:  # pragma: no cover - 本机是 Windows，保留跨平台兜底
+        yield Path("/")
+
+
+def scan_minecraft_dirs(
+    *,
+    roots=None,
+    exclude=(),
+    max_depth: int = 4,
+    max_dirs: int = 15000,
+) -> list[Path]:
+    """扫描本机其他 ``.minecraft`` 根目录（排除系统目录与给定路径）。
+
+    ``roots`` 为空时遍历所有盘符；只做广度优先、深度与目录数都有上限，
+    调用方应放在后台线程里执行。返回的路径按字符串排序，方便稳定展示。
+    """
+    from collections import deque
+
+    excluded = {_norm(Path(item)) for item in exclude}
+    found: list[Path] = []
+    seeds = [Path(item) for item in roots] if roots else list(_drive_roots())
+    queue = deque((seed, 0) for seed in seeds)
+    visited = 0
+    while queue and visited < max_dirs:
+        current, depth = queue.popleft()
+        visited += 1
+        if _norm(current) in excluded:
+            continue
+        if looks_like_minecraft_root(current):
+            found.append(current)
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            name = entry.name.lower()
+            if name in _SKIP_DIR_NAMES or name.startswith("$"):
+                continue
+            child = Path(entry.path)
+            if _norm(child) in excluded:
+                continue
+            queue.append((child, depth + 1))
+    found.sort(key=_norm)
+    return found
 
 
 def safe_instance_id(name: str, fallback: str = "") -> str:

@@ -101,9 +101,10 @@ class _PreviewTile(QWidget):
 
 
 class SkinPage(QWidget):
-    def __init__(self, window: Any) -> None:
+    def __init__(self, window: Any, *, read_only: bool = False) -> None:
         super().__init__()
         self.window = window
+        self.read_only = read_only
         self._data: bytes | None = None
         self._info: Any | None = None
         self._busy = False
@@ -111,6 +112,14 @@ class SkinPage(QWidget):
         self._build()
         self._reload_state()
         self._refresh_library()
+        if read_only:
+            # 上传链路暂时不可靠，入口只保留查看；头像仍是本地缓存的那张
+            self.upload.setVisible(False)
+            self.upload.setEnabled(False)
+            sync = getattr(self, "sync_btn", None)
+            if sync is not None:
+                sync.setVisible(False)
+            self.info.setText("当前仅展示本地已缓存的皮肤；上传功能暂未开放。")
 
     def _build(self) -> None:
         style = getattr(self.window.config, "skin_layout", "v1")

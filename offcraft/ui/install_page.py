@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -91,7 +93,9 @@ class LoaderRow(QFrame):
         self.title = QLabel(title)
         self.title.setObjectName("h2" if tall else "h3")
         # 第一行（原版）不要标题，输入框自己说明用途
-        self.title.setVisible(not tall)
+        # 控件此时还没加入布局，只做隐藏，避免 setVisible(True) 让它独立成窗口闪一下
+        if tall:
+            self.title.hide()
         column.addWidget(self.title)
 
         self.name_edit: QLineEdit | None = None
@@ -112,7 +116,8 @@ class LoaderRow(QFrame):
         self.blurb = QLabel(blurb)
         self.blurb.setObjectName("muted")
         self.blurb.setWordWrap(True)
-        self.blurb.setVisible(not tall)
+        if tall:
+            self.blurb.hide()
         column.addWidget(self.blurb)
         layout.addLayout(column, 1)
 
@@ -125,7 +130,8 @@ class LoaderRow(QFrame):
         self.version_combo = QComboBox()
         self.version_combo.setMinimumWidth(186)
         self.version_combo.currentIndexChanged.connect(lambda _i: self.changed.emit())
-        self.version_combo.setVisible(not tall)
+        if tall:
+            self.version_combo.hide()
         polish_combo(self.version_combo)
         layout.addWidget(self.version_combo, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -237,6 +243,9 @@ class LoaderRow(QFrame):
 class InstallPage(QWidget):
     """下载页里的「安装版本」子页（不是弹窗，返回即回到游戏版本列表）。"""
 
+    #: 安装位置下拉框末尾的哨兵项：选中它等于「挑一个文件夹」
+    PICK_LOCATION = "__pick_location__"
+
     def __init__(self, window: Any) -> None:
         super().__init__()
         self.window = window
@@ -245,6 +254,8 @@ class InstallPage(QWidget):
         self._token = 0
         self._cache: dict[str, list[LoaderBuild]] = {}
         self._loading: set[str] = set()
+        #: 用户手动挑过的其他安装目录
+        self._locations: list[Path] = []
         self._build()
 
     # ------------------------------------------------------------------ UI
@@ -269,6 +280,23 @@ class InstallPage(QWidget):
         heads.addWidget(self.subtitle)
         header.addLayout(heads, 1)
         root.addLayout(header)
+
+        # 安装位置：默认用当前游戏目录，也可以安装到本机任意文件夹。
+        location = Card(margins=(12, 10, 12, 10))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        label = QLabel("安装位置")
+        label.setObjectName("muted")
+        row.addWidget(label)
+        self.location_combo = QComboBox()
+        self.location_combo.setMinimumHeight(32)
+        self.location_combo.currentIndexChanged.connect(self._on_location_changed)
+        row.addWidget(self.location_combo, 1)
+        self.browse_button = QPushButton("选择文件夹…")
+        self.browse_button.clicked.connect(self._browse_location)
+        row.addWidget(self.browse_button)
+        location.add_layout(row)
+        root.addWidget(location)
 
         wrap = Card(margins=(12, 12, 12, 12))
         self.rows: dict[str, LoaderRow] = {}
@@ -309,6 +337,53 @@ class InstallPage(QWidget):
         footer.addWidget(self.install_button)
         root.addLayout(footer)
 
+    # ------------------------------------------------------------------ 位置
+    def install_root(self) -> Path:
+        data = self.location_combo.currentData()
+        if data and data != self.PICK_LOCATION:
+            return Path(str(data))
+        return Path(self.window.game_dir())
+
+    def _rebuild_locations(self, select: str = "") -> None:
+        current = select or str(self.install_root())
+        roots: list[Path] = []
+        for path in [Path(self.window.game_dir()), *self._locations]:
+            if path not in roots:
+                roots.append(path)
+        self.location_combo.blockSignals(True)
+        self.location_combo.clear()
+        configured = str(getattr(self.window.config, "game_dir", "") or "")
+        for index, path in enumerate(roots):
+            if index == 0:
+                text = f"{'当前目录' if configured else '默认目录'} · {path}"
+            else:
+                text = f"自定义 · {path}"
+            self.location_combo.addItem(text, str(path))
+        self.location_combo.addItem("选择其他文件夹…", self.PICK_LOCATION)
+        index = next((i for i in range(self.location_combo.count()) if self.location_combo.itemData(i) == current), 0)
+        self.location_combo.setCurrentIndex(index)
+        self.location_combo.blockSignals(False)
+        self.location_combo.setToolTip(current)
+
+    def _on_location_changed(self, _index: int) -> None:
+        if self.location_combo.currentData() == self.PICK_LOCATION:
+            self._browse_location()
+            return
+        self.location_combo.setToolTip(str(self.install_root()))
+        self._refresh_footer()
+
+    def _browse_location(self) -> None:
+        start = str(self.install_root())
+        folder = QFileDialog.getExistingDirectory(self, "选择游戏安装目录", start)
+        if not folder:
+            self._rebuild_locations()
+            return
+        path = Path(folder)
+        if path not in self._locations:
+            self._locations.append(path)
+        self._rebuild_locations(select=str(path))
+        self._refresh_footer()
+
     # ------------------------------------------------------------------ 打开
     def open_for(self, summary: VersionSummary) -> None:
         self.summary = summary
@@ -316,6 +391,7 @@ class InstallPage(QWidget):
         self._cache.clear()
         self._loading.clear()
         self.picked = "vanilla"
+        self._rebuild_locations()
         self.title_label.setText(f"安装 Minecraft {summary.id}")
         stamp = (summary.release_time or summary.time or "")[:10]
         self.subtitle.setText(
@@ -362,7 +438,7 @@ class InstallPage(QWidget):
         """同 MC 版本已装过的加载器：``{loader_key: 实例 id}``。"""
         taken: dict[str, str] = {}
         try:
-            instances = discover_instances(self.window.game_dir())
+            instances = discover_instances(self.install_root())
         except Exception:  # noqa: BLE001 - 列不出来不影响安装
             return taken
         for item in instances:
@@ -440,7 +516,9 @@ class InstallPage(QWidget):
             return
         if key == "vanilla":
             name = (row.name_edit.text().strip() if row.name_edit else "") or self.summary.id
-            self.hint.setText(f"将安装原版 {self.summary.id} → 目录 {name}（不能装模组）")
+            self.hint.setText(
+                f"将安装原版 {self.summary.id} → {self.install_root()} / {name}（不能装模组）"
+            )
             self.install_button.setText("安装原版")
             self.install_button.setEnabled(True)
             return
@@ -457,7 +535,7 @@ class InstallPage(QWidget):
         version = row.selected_version()
         self.hint.setText(
             f"将安装 Minecraft {self.summary.id} + {title} {version}"
-            "（目录名由安装器生成，可在安装后重命名）"
+            f" → {self.install_root()}（目录名由安装器生成，可在安装后重命名）"
         )
         self.install_button.setEnabled(bool(version))
 
@@ -475,4 +553,6 @@ class InstallPage(QWidget):
             return
         name_edit = self.rows["vanilla"].name_edit
         name = (name_edit.text().strip() if name_edit is not None else "") or self.summary.id
-        self.window.start_install(self.summary, key, version, name)
+        self.window.start_install(
+            self.summary, key, version, name, install_dir=str(self.install_root())
+        )

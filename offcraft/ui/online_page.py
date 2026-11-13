@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import secrets
 import threading
 from typing import Any
 
@@ -16,8 +17,10 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -35,12 +38,20 @@ from offcraft.ui.widgets import Badge, Card, ElidedLabel
 
 __all__ = ["OnlinePage"]
 
-SECTIONS = [("hot", "热门"), ("favorites", "我的收藏"), ("recent", "最近访问")]
+SECTIONS = [
+    ("hot", "热门"),
+    ("favorites", "我的收藏"),
+    ("published", "我的发布"),
+    ("recent", "最近访问"),
+    ("blocked", "已屏蔽"),
+]
 LATENCY_TONE = {"green": "green", "yellow": "amber", "red": "red", "unknown": "gray"}
 _EMPTY_HINTS = {
     "hot": "联网获取热门榜失败或未配置下载源，只显示本地收藏。",
     "favorites": "还没有收藏服务器，用上方「添加服务器」加入你的第一台。",
+    "published": "还没有上报过服务器。在服务器卡片的「管理」里选择「上报到公共榜单」。",
     "recent": "最近访问会记录你探测或加入过的服务器。",
+    "blocked": "没有屏蔽任何服务器。在服务器卡片的「管理」里可以屏蔽别人上架的服务器。",
 }
 
 
@@ -126,7 +137,14 @@ class ComplaintDialog(QDialog):
 class ServerCard(QWidget):
     """一台服务器的状态卡。"""
 
-    def __init__(self, page: "OnlinePage", listing: ServerListing, favorited: bool, icon: bytes | None) -> None:
+    def __init__(
+        self,
+        page: "OnlinePage",
+        listing: ServerListing,
+        favorited: bool,
+        icon: bytes | None,
+        manage: list[tuple[str, Any]] | None = None,
+    ) -> None:
         super().__init__()
         self.page = page
         self.listing = listing
@@ -152,6 +170,9 @@ class ServerCard(QWidget):
         title_row.addWidget(self.title, 1)
         self.version = Badge("—", "blue")
         title_row.addWidget(self.version)
+        self.state = Badge("已下架", "gray")
+        self.state.setVisible(False)
+        title_row.addWidget(self.state)
         body.addLayout(title_row)
 
         self.motd = ElidedLabel(" ")
@@ -185,7 +206,6 @@ class ServerCard(QWidget):
             ("复制", self._on_copy),
             ("详情", self._on_detail),
             ("收藏", self._on_favorite),
-            ("上报", self._on_report),
             ("举报", self._on_complain),
             ("加入游戏", self._on_join),
         ):
@@ -194,6 +214,17 @@ class ServerCard(QWidget):
             button.setMinimumHeight(28)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(handler)
+            actions.addWidget(button)
+
+        if manage:
+            button = QPushButton("管理")
+            button.setObjectName("ghost")
+            button.setMinimumHeight(28)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            menu = QMenu(button)
+            for text, handler in manage:
+                menu.addAction(text, handler)
+            button.setMenu(menu)
             actions.addWidget(button)
 
         self.update(listing, favorited, icon)
@@ -218,9 +249,6 @@ class ServerCard(QWidget):
     def _on_favorite(self) -> None:
         self.page.toggle_favorite(self.listing)
 
-    def _on_report(self) -> None:
-        self.page.report_listing(self.listing)
-
     def _on_complain(self) -> None:
         self.page.complain_about(self.listing)
 
@@ -234,6 +262,7 @@ class ServerCard(QWidget):
             self._favorite_label()
         if icon is not None:
             self._icon = icon
+        self.state.setVisible(not listing.visible)
         if listing.ok:
             self._set_icon(getattr(self, "_icon", None))
             self.title.setText(listing.name)
@@ -366,21 +395,68 @@ class OnlinePage(QWidget):
         rows: list[tuple[ServerListing, bool, bytes | None]] = []
         if self._section == "hot":
             for listing in self._hot:
+                if self.store.is_blocked(listing.host, listing.port):
+                    continue
+                label = self.store.label_for(listing.host, listing.port)
+                if label:
+                    listing.label = label
                 rows.append((listing, listing.key in favs, self._icons.get(listing.key)))
             return rows
-        entries = self.store.list_entries() if self._section == "favorites" else self.store.list_recent()
+        if self._section == "published":
+            for record in self.store.list_published():
+                host = str(record.get("host") or "")
+                port = int(record.get("port") or 0) or 25565
+                label = str(record.get("label") or "") or self.store.label_for(host, port)
+                entry = ServerEntry(host=host, port=port, label=label)
+                listing = _listing_from(entry, self.store.cached(host, port))
+                listing.visible = bool(record.get("visible", True))
+                rows.append((listing, listing.key in favs, self._icons.get(listing.key)))
+            return rows
+        if self._section == "blocked":
+            entries = self.store.list_blocked()
+        else:
+            entries = self.store.list_entries() if self._section == "favorites" else self.store.list_recent()
         for entry in entries:
             listing = _listing_from(entry, self.store.cached(entry.host, entry.port))
             rows.append((listing, entry.key in favs, self._icons.get(entry.key)))
         return rows
 
+    def _manage_actions(self, listing: ServerListing) -> list[tuple[str, Any]]:
+        """按「是不是自己发布的」给出管理菜单项。"""
+        record = self.store.published_for(listing.host, listing.port)
+        if record is not None:
+            visible = bool(record.get("visible", True))
+            return [
+                ("修改名称", lambda: self.modify_published(listing)),
+                ("下架（从榜单隐藏）" if visible else "重新上架", lambda: self.toggle_visible(listing, record)),
+                ("删除发布", lambda: self.delete_published(listing)),
+            ]
+        if self.store.is_blocked(listing.host, listing.port):
+            return [
+                ("取消屏蔽", lambda: self.unblock_listing(listing)),
+                ("命名（本机）", lambda: self.rename_local(listing)),
+                ("上报到公共榜单", lambda: self.report_listing(listing)),
+            ]
+        return [
+            ("命名（本机）", lambda: self.rename_local(listing)),
+            ("屏蔽（本机）", lambda: self.block_listing(listing)),
+            ("上报到公共榜单", lambda: self.report_listing(listing)),
+        ]
+
     # ---------------------------------------------------------------- 渲染
     def _rebuild(self) -> None:
         for card in self._cards.values():
+            card.setParent(None)
             card.deleteLater()
         self._cards.clear()
+        # takeAt 只是把项从布局里摘掉，控件本身还在：必须手动删除，
+        # 否则切换分区后旧的空状态提示会叠在新卡片上。
         while self.list_layout.count() > 1:
-            self.list_layout.takeAt(0)
+            item = self.list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
         rows = self._current_rows()
         for listing, favorited, icon in rows:
             self._add_card(listing, favorited, icon)
@@ -388,7 +464,9 @@ class OnlinePage(QWidget):
             self._add_hint()
 
     def _add_card(self, listing: ServerListing, favorited: bool, icon: bytes | None) -> ServerCard:
-        card = ServerCard(self, listing, favorited, icon)
+        card = ServerCard(
+            self, listing, favorited, icon, manage=self._manage_actions(listing)
+        )
         self._cards[listing.key] = card
         self.list_layout.insertWidget(self.list_layout.count() - 1, card)
         return card
@@ -421,14 +499,30 @@ class OnlinePage(QWidget):
                 hits, _total = self._directory().list(query, limit=30)
                 self.window.post(lambda: self._apply_hot(hits))
                 return
-            entries = self.store.list_entries() if section == "favorites" else self.store.list_recent()
+            if section == "published":
+                entries = []
+                for record in self.store.list_published():
+                    host = str(record.get("host") or "")
+                    port = int(record.get("port") or 0) or 25565
+                    label = str(record.get("label") or "") or self.store.label_for(host, port)
+                    entries.append(
+                        (ServerEntry(host=host, port=port, label=label),
+                         bool(record.get("visible", True)))
+                    )
+            elif section == "blocked":
+                entries = [(entry, True) for entry in self.store.list_blocked()]
+            elif section == "favorites":
+                entries = [(entry, True) for entry in self.store.list_entries()]
+            else:
+                entries = [(entry, True) for entry in self.store.list_recent()]
             favs = {item.key for item in self.store.list_entries()}
-            for entry in entries:
+            for entry, visible in entries:
                 result = ping_server(entry.address, allow_local=allow_local)
                 if result.favicon:
                     self._icons[entry.key] = result.favicon
                 self.store.remember(result)
                 listing = _listing_from(entry, result)
+                listing.visible = visible
                 fav = entry.key in favs
                 icon = self._icons.get(entry.key)
                 self.window.post(lambda l=listing, f=fav, i=icon: self._update_card(l, f, i))
@@ -488,28 +582,152 @@ class OnlinePage(QWidget):
         self._rebuild()
 
     def report_listing(self, listing: ServerListing) -> None:
-        """手动上报服务器到公共榜单（用户确认后才发送）。"""
+        """手动上报服务器到公共榜单（用户确认后才发送），并登记本机管理密钥。"""
         answer = QMessageBox.question(
             self.window,
             "上报服务器",
             f"将把 {listing.address} 与备注上报到公共榜单，供其他玩家发现。\n"
+            "上报后会生成仅保存在本机的管理密钥，可在「我的发布」里修改或删除。\n"
             "只有点击「是」才会发送，是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        entry = ServerEntry(host=listing.host, port=listing.port, label=listing.label)
+        record = self.store.published_for(listing.host, listing.port)
+        owner = str((record or {}).get("owner") or secrets.token_hex(16))
+        label = listing.label
 
         def worker() -> None:
             try:
-                self._directory().report(entry.address, entry.label)
+                data = self._directory().report(listing.address, label, owner)
             except Exception as exc:  # noqa: BLE001 - 失败提示用户
                 self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
                 return
-            self.window.post(lambda: self.window.notice("已上报到公共榜单，审核后展示", "OK"))
+            owned = bool(data.get("owned"))
+            self.window.post(lambda: self._after_report(listing, label, owner, owned))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _after_report(
+        self, listing: ServerListing, label: str, owner: str, owned: bool
+    ) -> None:
+        if not owned:
+            self.window.notice("该服务器已在公共榜单中（由其他玩家上报），无法管理", "WARN")
+            return
+        self.store.publish_record(listing.host, listing.port, label, owner)
+        self.store.set_label(listing.host, listing.port, label)
+        self._rebuild()
+        self.window.notice("已上报到公共榜单，可在「我的发布」里管理", "OK")
+
+    # ------------------------------------------------------------ 本机命名/屏蔽
+    def rename_local(self, listing: ServerListing) -> None:
+        current = self.store.label_for(listing.host, listing.port) or listing.label
+        text, ok = QInputDialog.getText(
+            self.window, "命名（本机）", "只改你本机看到的名称，不会上传：", text=current
+        )
+        if not ok:
+            return
+        self.store.set_label(listing.host, listing.port, text.strip())
+        self._rebuild()
+        self.window.notice("已更新本机名称", "INFO")
+
+    def block_listing(self, listing: ServerListing) -> None:
+        self.store.block(listing.host, listing.port)
+        self._rebuild()
+        self.window.notice("已屏蔽（仅本机），可在「已屏蔽」里取消", "INFO")
+
+    def unblock_listing(self, listing: ServerListing) -> None:
+        self.store.unblock(listing.host, listing.port)
+        self._rebuild()
+        self.window.notice("已取消屏蔽", "INFO")
+
+    # ------------------------------------------------------------ 自己发布的管理
+    def modify_published(self, listing: ServerListing) -> None:
+        record = self.store.published_for(listing.host, listing.port)
+        if record is None:
+            return
+        current = str(record.get("label") or "")
+        text, ok = QInputDialog.getText(
+            self.window, "修改名称", "新的服务器名称（所有玩家可见）：", text=current
+        )
+        if not ok or text.strip() == current:
+            return
+        label = text.strip()[:40]
+        owner = str(record.get("owner") or "")
+
+        def worker() -> None:
+            try:
+                self._directory().update(listing.host, listing.port, label, owner)
+            except Exception as exc:  # noqa: BLE001 - 失败提示用户
+                self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
+                return
+            self.window.post(lambda: self._after_modify(listing, label, owner, record))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_modify(
+        self, listing: ServerListing, label: str, owner: str, record: dict[str, Any]
+    ) -> None:
+        self.store.publish_record(
+            listing.host, listing.port, label, owner,
+            visible=bool(record.get("visible", True)),
+        )
+        self.store.set_label(listing.host, listing.port, label)
+        listing.label = label
+        self._rebuild()
+        self.window.notice("已更新服务器名称", "OK")
+
+    def toggle_visible(self, listing: ServerListing, record: dict[str, Any]) -> None:
+        visible = not bool(record.get("visible", True))
+        owner = str(record.get("owner") or "")
+
+        def worker() -> None:
+            try:
+                self._directory().set_visible(listing.host, listing.port, visible, owner)
+            except Exception as exc:  # noqa: BLE001 - 失败提示用户
+                self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
+                return
+            self.window.post(lambda: self._after_visibility(listing, visible))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_visibility(self, listing: ServerListing, visible: bool) -> None:
+        self.store.set_published_visible(listing.host, listing.port, visible)
+        listing.visible = visible
+        self._rebuild()
+        self.window.notice("已重新上架" if visible else "已下架（从公共榜单隐藏）", "OK")
+
+    def delete_published(self, listing: ServerListing) -> None:
+        record = self.store.published_for(listing.host, listing.port)
+        if record is None:
+            return
+        answer = QMessageBox.question(
+            self.window,
+            "删除发布",
+            f"将从公共榜单删除 {listing.address}，其他玩家将不再看到它。\n是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        owner = str(record.get("owner") or "")
+
+        def worker() -> None:
+            try:
+                self._directory().delete(listing.host, listing.port, owner)
+            except Exception as exc:  # noqa: BLE001 - 失败提示用户
+                self.window.post(lambda m=str(exc): self.window.notice(m, "WARN"))
+                return
+            self.window.post(lambda: self._after_delete(listing))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_delete(self, listing: ServerListing) -> None:
+        self.store.drop_published(listing.host, listing.port)
+        self._hot = [item for item in self._hot if item.key != listing.key]
+        self._rebuild()
+        self.window.notice("已从公共榜单删除", "OK")
 
     def complain_about(self, listing: ServerListing) -> None:
         """手动举报服务器（人工审核，不公开举报者身份）。"""

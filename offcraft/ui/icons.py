@@ -37,6 +37,7 @@ _PATHS = {
     "chevron-down": '<path d="m7 9.6 5 5 5-5"/>',
     "chevron-up": '<path d="m7 14.4 5-5 5 5"/>',
     "chevron-right": '<path d="m9.6 7 5 5-5 5"/>',
+    "chevron-left": '<path d="m14.4 7-5 5 5 5"/>',
     "palette": '<path d="M12 3.9a8.1 8.1 0 1 0 0 16.2h1a2 2 0 0 0 1.5-3.4 2 2 0 0 1 1.5-3.4h1.4A3.9 3.9 0 0 0 20.2 10a8.1 8.1 0 0 0-8.2-6.1Z"/>'
     '<circle cx="8" cy="11.1" r="1"/><circle cx="11" cy="7.6" r="1"/><circle cx="15" cy="9.1" r="1"/>',
     "check": '<path d="m5 12.6 4.4 4.3 9.6-9.8"/>',

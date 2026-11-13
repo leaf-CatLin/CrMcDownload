@@ -26,9 +26,8 @@ from offcraft.plugins.context import PluginContext, PluginHost
 __all__ = ["PluginRecord", "PluginRegistry"]
 
 #: 官方内置插件模块白名单（新增官方插件在此登记；第三方目录扫描刻意不做）
-BUILTIN_MODULES: tuple[str, ...] = (
-    "offcraft.plugins.builtin.diagnostics",
-)
+#: 目前没有随包内置的插件，离线联机以官方 bundle 形式按需下载安装。
+BUILTIN_MODULES: tuple[str, ...] = ()
 
 _STATE_FILE = "plugins.json"
 

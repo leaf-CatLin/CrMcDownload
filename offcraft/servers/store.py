@@ -86,6 +86,12 @@ class ServerStore:
     entries: list[ServerEntry] = field(default_factory=list)
     recent: list[str] = field(default_factory=list)
     cache: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    #: 本机备注名（key → 名称），对公共榜单条目也生效；不上传服务端
+    labels: dict[str, str] = field(default_factory=dict)
+    #: 本机屏蔽名单（key），只在「热门」里隐藏，不影响收藏 / 最近访问
+    blocked: list[str] = field(default_factory=list)
+    #: 自己上报过的服务器（key → 记录），保存管理密钥用于修改 / 上下架 / 删除
+    published: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _dirty: bool = False
 
@@ -116,6 +122,19 @@ class ServerStore:
                 if isinstance(item, dict)
             ]
             self.recent = [str(item) for item in (data.get("recent") or [])][:RECENT_MAX]
+            self.labels = {
+                str(key): str(value)[:40]
+                for key, value in (data.get("labels") or {}).items()
+                if isinstance(key, str) and isinstance(value, str) and value.strip()
+            }
+            self.blocked = [
+                str(item) for item in (data.get("blocked") or []) if isinstance(item, str)
+            ]
+            self.published = {
+                str(key): dict(value)
+                for key, value in (data.get("published") or {}).items()
+                if isinstance(key, str) and isinstance(value, dict)
+            }
             raw_cache = data.get("cache") or {}
             self.cache = {
                 key: (float(value.get("ts") or 0.0), dict(value.get("result") or {}))
@@ -129,6 +148,9 @@ class ServerStore:
             payload = {
                 "servers": [item.to_json() for item in self.entries],
                 "recent": list(self.recent),
+                "labels": dict(self.labels),
+                "blocked": list(self.blocked),
+                "published": {key: dict(value) for key, value in self.published.items()},
                 "cache": {key: {"ts": ts, "result": result} for key, (ts, result) in self.cache.items()},
             }
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +203,105 @@ class ServerStore:
             self.cache.pop(key, None)
         self.save()
         return len(self.entries) != before
+
+    # ------------------------------------------------------------ 本机备注/屏蔽
+    def set_label(self, host: str, port: int = DEFAULT_PORT, label: str = "") -> None:
+        """设置本机备注名（空字符串表示清除）；不收藏、不上传。"""
+        key = key_of(host, port)
+        text = str(label or "").strip()[:40]
+        with self._lock:
+            if text:
+                self.labels[key] = text
+            else:
+                self.labels.pop(key, None)
+            for index, item in enumerate(self.entries):
+                if item.key == key:
+                    self.entries[index] = ServerEntry(
+                        host=item.host, port=item.port, label=text, added_at=item.added_at
+                    )
+        self.save()
+
+    def label_for(self, host: str, port: int = DEFAULT_PORT) -> str:
+        with self._lock:
+            return self.labels.get(key_of(host, port), "")
+
+    def block(self, host: str, port: int = DEFAULT_PORT) -> None:
+        """把服务器加入本机屏蔽名单（只在热门榜隐藏）。"""
+        key = key_of(host, port)
+        with self._lock:
+            if key not in self.blocked:
+                self.blocked.append(key)
+        self.save()
+
+    def unblock(self, host: str, port: int = DEFAULT_PORT) -> None:
+        key = key_of(host, port)
+        with self._lock:
+            self.blocked = [item for item in self.blocked if item != key]
+        self.save()
+
+    def is_blocked(self, host: str, port: int = DEFAULT_PORT) -> bool:
+        with self._lock:
+            return key_of(host, port) in self.blocked
+
+    def list_blocked(self) -> list[ServerEntry]:
+        with self._lock:
+            keys = list(self.blocked)
+        out: list[ServerEntry] = []
+        for key in keys:
+            host, _, port_text = key.rpartition(":")
+            if host:
+                out.append(
+                    ServerEntry(
+                        host=host,
+                        port=int(port_text or DEFAULT_PORT),
+                        label=self.label_for(host, int(port_text or DEFAULT_PORT)),
+                    )
+                )
+        return out
+
+    # -------------------------------------------------------------- 我发布的
+    def publish_record(
+        self, host: str, port: int, label: str, owner: str, *, visible: bool = True
+    ) -> dict[str, Any]:
+        """记录自己上报的服务器与管理密钥（密钥只存本机，用于后续管理）。"""
+        key = key_of(host, port)
+        record = {
+            "host": str(host).lower(),
+            "port": int(port),
+            "label": str(label or "").strip()[:40],
+            "owner": str(owner or ""),
+            "visible": bool(visible),
+            "added_at": time.time(),
+        }
+        with self._lock:
+            self.published[key] = record
+        self.save()
+        return record
+
+    def published_for(self, host: str, port: int = DEFAULT_PORT) -> dict[str, Any] | None:
+        with self._lock:
+            item = self.published.get(key_of(host, port))
+            return dict(item) if item else None
+
+    def set_published_visible(self, host: str, port: int = DEFAULT_PORT, visible: bool = True) -> None:
+        key = key_of(host, port)
+        with self._lock:
+            item = self.published.get(key)
+            if item is not None:
+                item["visible"] = bool(visible)
+        self.save()
+
+    def drop_published(self, host: str, port: int = DEFAULT_PORT) -> None:
+        key = key_of(host, port)
+        with self._lock:
+            self.published.pop(key, None)
+        self.save()
+
+    def list_published(self) -> list[dict[str, Any]]:
+        with self._lock:
+            items = [dict(value) for value in self.published.values()]
+        items.sort(key=lambda item: float(item.get("added_at") or 0.0), reverse=True)
+        return items
 
     # -------------------------------------------------------------- 最近访问
     def touch_recent(self, host: str, port: int = DEFAULT_PORT) -> None:

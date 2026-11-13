@@ -144,7 +144,10 @@ class ContentPage(QWidget):
         for label, value in LOADER_CHOICES:
             self.loader_combo.addItem(label, value)
         self.loader_combo.currentIndexChanged.connect(self.reload)
-        self.loader_combo.setVisible(self.kind in ("mod", "modpack"))
+        # 只在需要隐藏时调用：控件此时还没加入布局，setVisible(True) 会让它
+        # 以独立顶层窗口的身份闪一下。
+        if self.kind not in ("mod", "modpack"):
+            self.loader_combo.hide()
         row.addWidget(self.loader_combo)
 
         self.sort_combo = QComboBox()
@@ -460,10 +463,11 @@ class ContentPage(QWidget):
         mc_dir = self._mc_dir()
         options: list[Target] = []
         for item in list(self.window.instances):
+            root = Path(item.root) if item.root else mc_dir
             isolated = bool(getattr(self.window.config, "isolation", False)) or (
-                read_pack_metadata(mc_dir, item.id) is not None
+                read_pack_metadata(root, item.id) is not None
             )
-            options.append(target_from_instance(mc_dir, item, isolated=isolated))
+            options.append(target_from_instance(root, item, isolated=isolated))
         seen = {option.key for option in options}
         for extra in self.extra_targets:
             if extra.key not in seen:

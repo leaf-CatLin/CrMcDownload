@@ -73,34 +73,21 @@ def style_combo_popup(popup: QWidget, view: QAbstractItemView | None = None) -> 
 
 
 def polish_combo(combo: QComboBox) -> None:
-    """去掉下拉列表默认的黑色外框（弹层窗口还没创建时什么也不做）。"""
-    view = combo.view()
-    if view is None:
-        return
-    try:
-        window = view.window()
-        # 只在真拿到弹层窗口时动手：弹层未创建时 view.window() 会返回主窗口，
-        # 盲目改它会把整个主窗口变成无边框。
-        is_popup = window is not None and window is not view and window is not combo.window()
-        if is_popup and (window.windowFlags() & Qt.WindowType.Popup):
-            style_combo_popup(window, view)
-        combo.setMaxVisibleItems(14)
-    except (AttributeError, RuntimeError):
-        pass
+    """保留给外部调用的兼容入口（当前统一由 ComboPolisher 在弹层显示时处理）。"""
+    return None
 
 
 class ComboPolisher(QObject):
     """全局事件过滤器：每个下拉弹层出现时都会去掉黑边。"""
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt 命名
-        etype = event.type()
-        if isinstance(obj, QComboBox) and etype in (QEvent.Type.Polish, QEvent.Type.Show):
-            polish_combo(obj)
-        elif etype == QEvent.Type.Show and isinstance(obj, QWidget) and (
-            obj.windowFlags() & Qt.WindowType.Popup
+        # 只在弹层真正显示时处理：构建页面时访问 combo.view() 会提前创建
+        # 所有下拉弹层的顶层窗口，Windows 上会闪出一排小窗口。
+        if (
+            event.type() == QEvent.Type.Show
+            and isinstance(obj, QWidget)
+            and (obj.windowFlags() & Qt.WindowType.Popup)
         ):
-            # 懒加载页面里的下拉框在初始化时还拿不到弹层窗口，这里在弹层自己
-            # Show 时补一次样式（菜单等没有列表视图，findChild 会返回 None）
             view = obj.findChild(QAbstractItemView)
             if view is not None:
                 style_combo_popup(obj, view)

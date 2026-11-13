@@ -3,8 +3,9 @@
 只在带加载器（Fabric/Forge/NeoForge/Quilt）的实例上生效：原版实例皮肤入口置灰。
 所有失败只记 WARN、返回状态，**绝不抛异常阻断启动**（由调用方在后台线程里 best-effort 执行）。
 
-优先用 Modrinth 内容层解析出文件，落到 ``mods/CustomSkinLoader.jar``；配置写
-``mods/CustomSkinLoader.json``，把皮肤源指向 ``{base}/skin/``。
+优先用 Modrinth 内容层解析出文件，落到 ``mods/CustomSkinLoader*.jar``；配置必须写
+``<游戏目录>/CustomSkinLoader/CustomSkinLoader.json``（CSL 只认这个位置），
+用 ``loadlist`` 把皮肤源指向镜像的 ``/skin/``。
 """
 
 from __future__ import annotations
@@ -19,11 +20,21 @@ from offcraft.instances import Instance, instance_game_dir
 from offcraft.mirror import Mirror
 from offcraft.net.downloader import DownloadError, DownloadTask, Downloader
 
-__all__ = ["CSL_CONFIG_NAME", "CSL_JAR_PREFIX", "CslStatus", "ensure_installed", "mods_dir_for"]
+__all__ = [
+    "CSL_CONFIG_DIR",
+    "CSL_CONFIG_NAME",
+    "CSL_JAR_PREFIX",
+    "CslStatus",
+    "build_config",
+    "config_path_for",
+    "ensure_installed",
+    "mods_dir_for",
+]
 
 #: Modrinth 上 CustomSkinLoader 的 slug / project_id（人工确认的稳定值）
 CSL_SLUG = "customskinloader"
 CSL_JAR_PREFIX = "CustomSkinLoader"
+CSL_CONFIG_DIR = "CustomSkinLoader"
 CSL_CONFIG_NAME = "CustomSkinLoader.json"
 
 #: 实例加载器 -> Modrinth loader facet
@@ -44,19 +55,32 @@ class CslStatus:
         return self.state in ("installed", "present") and self.config_written
 
 
-def mods_dir_for(mc_dir: Path | str, instance: Instance, *, isolated: bool = True) -> Path:
+def mods_dir_for(
+    mc_dir: Path | str, instance: Instance, *, isolated: bool = True
+) -> Path:
     return instance_game_dir(mc_dir, instance.id, isolated) / "mods"
 
 
+def config_path_for(
+    mc_dir: Path | str, instance: Instance, *, isolated: bool = True
+) -> Path:
+    """CSL 只认 ``<游戏目录>/CustomSkinLoader/CustomSkinLoader.json``。"""
+    return instance_game_dir(mc_dir, instance.id, isolated) / CSL_CONFIG_DIR / CSL_CONFIG_NAME
+
+
 def build_config(base_url: str) -> dict[str, Any]:
-    base = (base_url or "").rstrip("/")
+    """CSL 14.7+ 的 ``loadlist`` 格式；类型用 CustomSkinAPI 指向镜像的 ``/skin/``。"""
+    base = (base_url or "").rstrip("/") + "/"
     return {
-        "enabled": True,
-        "checkUpdate": False,
-        "firstMatch": ["@Legacy", "@Default"],
-        "SkinSourcingList": [f"{base}/skin/", f"{base}/skin/%s.png?model={{model}}"],
-        "CapeSourcingList": [],
-        "MainSkinOuterList": [],
+        "enable": True,
+        "loadlist": [
+            {
+                "name": "CrMCDownload",
+                "type": "CustomSkinAPI",
+                "root": base,
+            },
+            {"name": "Mojang", "type": "MojangAPI"},
+        ],
     }
 
 
@@ -79,6 +103,7 @@ def ensure_installed(
     mirror: Mirror | Any,
     cancel: Any | None = None,
     log: Callable[[str, str], None] | None = None,
+    isolated: bool = True,
 ) -> CslStatus:
     """确保实例装了 CSL 并写好配置；失败只记 WARN。"""
 
@@ -93,7 +118,7 @@ def ensure_installed(
     if loader is None:
         return CslStatus("missing_loader", note="原版实例不支持皮肤 mod（需 Fabric/Forge/NeoForge/Quilt）")
 
-    mods = mods_dir_for(mc_dir, instance)
+    mods = mods_dir_for(mc_dir, instance, isolated=isolated)
     try:
         mods.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -101,7 +126,10 @@ def ensure_installed(
         return CslStatus("failed", note="无法创建 mods 目录")
 
     existing = sorted(mods.glob(f"{CSL_JAR_PREFIX}*.jar"))
-    config_written = _write_config(mods / CSL_CONFIG_NAME, base_url)
+    # 配置文件必须放在 <游戏目录>/CustomSkinLoader/，放 mods/ 不会被读取。
+    config_written = _write_config(
+        config_path_for(mc_dir, instance, isolated=isolated), base_url
+    )
     if existing:
         return CslStatus("present", jar=existing[0].name, config_written=config_written, note="已存在 CustomSkinLoader")
 

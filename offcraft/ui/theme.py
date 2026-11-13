@@ -27,12 +27,15 @@ __all__ = [
     "WARN",
     "app_qss",
     "block_pixmap",
+    "full_qss",
     "human_count",
     "human_size",
     "human_date",
     "initial_pixmap",
     "loader_color",
     "loader_pixmap",
+    "overlay",
+    "pcl_qss",
 ]
 
 BG = "#F2F6FC"
@@ -47,15 +50,50 @@ OK = "#2E9E6B"
 WARN = "#D18B22"
 DANGER = "#D24B45"
 
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(char * 2 for char in text)
+    if len(text) != 6:
+        return (0, 0, 0)
+    try:
+        return tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return (0, 0, 0)
+
+
+def overlay(
+    color: str,
+    base: str = BG,
+    *,
+    tolerance: float = 3.0,
+    floor: float = 0.35,
+    ceiling: float = 0.94,
+) -> str:
+    """把一个不透明颜色换算成叠在 ``base`` 上的半透明色。
+
+    规则：与底色相同的控件直接 100% 透明（叠上去也看不出差别）；
+    颜色不同则把 alpha 调到刚好能在默认背景上保持原色（每通道误差 ≤ tolerance），
+    这样默认背景下观感不变，换成自定义背景时又能透出底层，不会变成纯色块。
+    """
+    target = _rgb(color)
+    ground = _rgb(base)
+    diff = max(abs(target[index] - ground[index]) for index in range(3))
+    if diff <= tolerance:
+        return f"rgba({target[0]}, {target[1]}, {target[2]}, 0.00)"
+    alpha = min(ceiling, max(floor, 1 - tolerance / diff))
+    return f"rgba({target[0]}, {target[1]}, {target[2]}, {alpha:.2f})"
+
 #: 毛玻璃：半透明白 + 亮边，让可自定义背景从卡片下透出来。
 #: 内层控件（输入框/按钮）叠在卡片上时两层 alpha 会相乘，若各自都接近不透明，
 #: 背景就被洗成白色，因此每一层都要明显更透。
-GLASS = "rgba(255, 255, 255, 0.72)"
-GLASS_SOFT = "rgba(247, 249, 253, 0.60)"
-GLASS_EDGE = "rgba(255, 255, 255, 0.84)"
-GLASS_INPUT = "rgba(255, 255, 255, 0.56)"
-GLASS_HOVER = "rgba(242, 246, 254, 0.68)"
-GLASS_PRESSED = "rgba(226, 234, 248, 0.80)"
+GLASS = overlay("#FFFFFF")
+GLASS_SOFT = overlay("#F7F9FD", floor=0.42)
+GLASS_EDGE = overlay("#FFFFFF", tolerance=1.0)
+GLASS_INPUT = overlay("#FFFFFF", floor=0.55)
+GLASS_HOVER = overlay("#F0F5FD", floor=0.40)
+GLASS_PRESSED = overlay("#E2EAF8", floor=0.50)
 
 #: 加载器/内容类型的标识色
 LOADER_COLORS = {
@@ -307,6 +345,22 @@ QWidget {{
     font-family: "Microsoft YaHei UI";
     font-size: 10pt;
 }}
+/* 容器类控件一律透明，避免在卡片右侧露出默认白底 */
+QStackedWidget, QScrollArea, QListWidget, QTreeWidget, QListView, QTableView,
+QScrollArea > QWidget > QWidget {{
+    background: transparent;
+    border: none;
+}}
+/* 列表 / 表格的 viewport 由 QAbstractScrollArea 绘制，必须单独置空，
+   否则 Fusion 风格会用调色板 Base（白）填满列表区域。 */
+QAbstractScrollArea, QAbstractItemView {{
+    background: transparent;
+    border: none;
+}}
+QAbstractScrollArea > QWidget,
+QAbstractItemView > QWidget {{
+    background: transparent;
+}}
 QMainWindow, QDialog {{
     background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
         stop:0 #F7FAFF, stop:0.55 {BG}, stop:1 #EDF2FA);
@@ -321,7 +375,7 @@ QFrame#sidebar {{
 }}
 QFrame#card {{
     background: qlineargradient(x1:0, y1:0, x2:0.6, y2:1,
-        stop:0 rgba(255, 255, 255, 0.86), stop:1 rgba(255, 255, 255, 0.64));
+        stop:0 {GLASS}, stop:1 {overlay("#FFFFFF", tolerance=8)});
     border: 1px solid {GLASS_EDGE};
     border-radius: 14px;
 }}
@@ -376,6 +430,21 @@ QLabel#stepBadge {{
     font-size: 8.5pt;
 }}
 QLabel#brand {{ font-size: 14pt; font-weight: 700; color: {TEXT}; }}
+QLabel#pageTitle {{ font-size: 11pt; font-weight: 700; color: {TEXT}; }}
+QPushButton#quickTile {{
+    background: rgba(247, 249, 253, 0.60);
+    border: 1px solid rgba(229, 235, 244, 0.85);
+    border-radius: 9px;
+    text-align: left;
+    padding: 7px 10px;
+    color: {TEXT};
+}}
+QPushButton#quickTile:hover {{ background: rgba(234, 241, 255, 0.78); border-color: #C9D8F5; }}
+QPushButton#quickTile:checked {{
+    background: rgba(234, 241, 255, 0.82);
+    color: {ACCENT};
+    font-weight: 600;
+}}
 QLabel#brandSub {{ font-size: 8pt; color: {MUTED}; }}
 QLabel#title {{ font-size: 19pt; font-weight: 700; }}
 QLabel#h2 {{ font-size: 13pt; font-weight: 700; }}
@@ -393,7 +462,14 @@ QLineEdit#heroName {{
     font-weight: 700;
     padding: 2px 8px;
     border-radius: 8px;
+    background: transparent;
+    border: 1px solid transparent;
 }}
+QLineEdit#heroName:hover {{
+    background: rgba(255, 255, 255, 0.58);
+    border-color: rgba(229, 235, 244, 0.90);
+}}
+QLineEdit#heroName:focus {{ background: #FFFFFF; border-color: {ACCENT}; }}
 QComboBox#heroVersion {{
     font-size: 13pt;
     font-weight: 700;
@@ -411,7 +487,23 @@ QPushButton#heroMenu {{
 QPushButton#heroMenu:hover {{ color: {TEXT}; }}
 QLabel#versionTag {{ color: #B4BCC9; font-size: 8pt; }}
 QListWidget#homeList {{ background: transparent; }}
-QListWidget#homeList::item {{ padding: 6px 4px; border-radius: 7px; }}
+QListWidget#homeList::item {{ margin: 4px 2px; padding: 7px 6px; border-radius: 8px; }}
+/* 启动页左侧资源分类（模组 / 存档 / 资源 / 光影） */
+QPushButton#homeTab {{
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 4px 8px;
+    color: {MUTED};
+    font-size: 9pt;
+    text-align: left;
+}}
+QPushButton#homeTab:hover {{ color: {TEXT}; background: rgba(238, 243, 251, 0.75); }}
+QPushButton#homeTab:checked {{
+    color: {ACCENT};
+    font-weight: 600;
+    background: rgba(233, 241, 254, 0.90);
+}}
 QLabel#status {{ color: {MUTED}; font-size: 9pt; }}
 QLabel#error {{ color: {DANGER}; font-size: 9pt; }}
 QLabel#link {{ color: {ACCENT}; font-size: 9pt; }}
@@ -448,7 +540,7 @@ QPushButton {{
     padding: 7px 14px;
 }}
 QPushButton:hover {{ background: {GLASS_HOVER}; border-color: #C9D8F5; }}
-QPushButton:pressed {{ background: {GLASS_PRESSED}; }}
+QPushButton:pressed {{ background: {GLASS_PRESSED}; padding-top: 9px; padding-bottom: 5px; }}
 QPushButton:disabled {{ color: #AEB6C4; background: rgba(246, 248, 251, 0.50); border-color: rgba(229, 235, 244, 0.75); }}
 QPushButton#nav {{
     background: transparent;
@@ -577,10 +669,10 @@ QTreeWidget, QListWidget {{
     border: none;
     outline: none;
 }}
-QTreeWidget::item {{ padding: 7px 4px; border-radius: 7px; }}
+QTreeWidget::item {{ margin: 3px 2px; padding: 7px 4px; border-radius: 7px; }}
 QTreeWidget::item:hover {{ background: rgba(244, 247, 253, 0.70); }}
 QTreeWidget::item:selected {{ background: rgba(234, 241, 255, 0.82); color: {TEXT}; }}
-QListWidget::item {{ border-radius: 7px; }}
+QListWidget::item {{ margin: 4px 3px; padding: 4px 4px; border-radius: 8px; }}
 QListWidget::item:hover {{ background: rgba(244, 247, 253, 0.70); }}
 QListWidget::item:selected {{ background: rgba(234, 241, 255, 0.82); }}
 QHeaderView::section {{
@@ -624,3 +716,398 @@ QToolTip {{
     background: #1F2530; color: #FFFFFF; border: none; border-radius: 6px; padding: 5px 8px;
 }}
 """
+
+
+#: 原版 PCL2 配色（取自 PCL2 仓库 Application.xaml 的 ColorBrush / ColorBrushGray 色表）
+PCL_TEXT = "#343D4A"
+PCL_ACCENT_DARK = "#0B5BCB"
+PCL_ACCENT = "#1370F3"
+PCL_ACCENT_HOVER = "#4890F5"
+PCL_ACCENT_LIGHT = "#96C0F9"
+PCL_SOFT = "#D5E6FD"
+PCL_SOFT2 = "#E0EAFD"
+PCL_BG = "#EAF2FE"
+PCL_GRAY1 = "#404040"
+PCL_GRAY2 = "#737373"
+PCL_GRAY3 = "#8C8C8C"
+PCL_GRAY4 = "#A6A6A6"
+PCL_GRAY5 = "#CCCCCC"
+PCL_GRAY6 = "#EBEBEB"
+PCL_GRAY7 = "#F0F0F0"
+PCL_GRAY8 = "#F5F5F5"
+PCL_RED = "#FF4C4C"
+PCL_RED_DARK = "#CE2111"
+
+#: 原版 PCL 的窗口背景渐变（上白下浅蓝）
+PCL_BACKGROUND = (
+    (0.0, "#FFFFFF"),
+    (0.55, "#F3F8FF"),
+    (1.0, PCL_BG),
+)
+
+
+def pcl_qss() -> str:
+    """复刻原版 PCL2 的界面样式，追加在 :func:`app_qss` 之后覆盖配色。
+
+    只覆盖颜色/圆角/边框，布局与控件结构保持不变：白底卡片、浅蓝描边、
+    近乎方角的按钮（radius 3）与 PCL 蓝强调色 ``#1370F3``。
+    """
+    check = _qss_icon("check", "#FFFFFF", 16)
+    check_icon = f"image: url({check});" if check else ""
+    arrow_down = _qss_icon("chevron-down", PCL_TEXT, 14)
+    down_arrow = (
+        f"QComboBox::down-arrow {{ image: url({arrow_down}); width: 13px; height: 13px; }}"
+        if arrow_down
+        else ""
+    )
+    return f"""
+QWidget {{ color: {PCL_TEXT}; }}
+/* 主窗口背景由 Backdrop 绘制（含 PCL 圆角外壳），这里必须透明 */
+QMainWindow {{ background: transparent; }}
+QDialog {{
+    background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
+        stop:0 #FFFFFF, stop:0.55 #F3F8FF, stop:1 {PCL_BG});
+}}
+QFrame#pclTopbar[shell="true"] {{
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}}
+QFrame#topbar {{
+    background: #FFFFFF;
+    border-bottom: 1px solid {PCL_SOFT};
+}}
+QFrame#sidebar {{
+    background: #FFFFFF;
+    border-right: 1px solid {PCL_SOFT};
+}}
+QFrame#card {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 6px;
+}}
+QFrame#softCard, QFrame#tile {{
+    background: {PCL_GRAY8};
+    border: 1px solid {PCL_SOFT};
+    border-radius: 6px;
+}}
+QFrame#tile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
+QFrame#installHead {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 6px;
+}}
+QFrame#loaderRow {{
+    background: {PCL_GRAY8};
+    border: 1px solid {PCL_SOFT};
+    border-radius: 6px;
+}}
+QFrame#loaderRow:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
+QFrame#loaderRow[picked="true"] {{
+    background: {PCL_SOFT};
+    border: 2px solid {PCL_ACCENT};
+}}
+QFrame#loaderRow[dimmed="true"] {{
+    background: {PCL_GRAY7};
+    border-color: {PCL_GRAY6};
+}}
+QLabel#dimTitle {{ color: {PCL_GRAY4}; }}
+QLabel#dimText {{ color: {PCL_GRAY4}; }}
+QLabel#pageTitle {{ color: {PCL_TEXT}; }}
+QPushButton#quickTile {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 3px;
+    color: {PCL_TEXT};
+}}
+QPushButton#quickTile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
+QPushButton#quickTile:checked {{
+    background: {PCL_SOFT};
+    color: {PCL_ACCENT_DARK};
+}}
+QLabel#muted {{ color: {PCL_GRAY2}; }}
+QLabel#mutedSmall {{ color: {PCL_GRAY3}; }}
+QLabel#status {{ color: {PCL_GRAY2}; }}
+QLabel#versionTag {{ color: {PCL_GRAY3}; }}
+QLabel#link {{ color: {PCL_ACCENT}; }}
+QLabel#stepBadge {{
+    background: {PCL_BG};
+    color: {PCL_GRAY1};
+    border-radius: 3px;
+}}
+QPushButton {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 3px;
+    padding: 7px 14px;
+    color: {PCL_TEXT};
+}}
+QPushButton:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
+QPushButton:pressed {{
+    background: {PCL_SOFT};
+    border-color: {PCL_ACCENT};
+    padding: 7px 14px;
+}}
+QPushButton:disabled {{
+    background: {PCL_GRAY8};
+    border-color: {PCL_GRAY6};
+    color: {PCL_GRAY4};
+}}
+QPushButton#nav {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    color: {PCL_GRAY1};
+}}
+QPushButton#nav:hover {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
+QPushButton#nav:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
+QPushButton#topnav {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    color: {PCL_GRAY1};
+}}
+QPushButton#topnav:hover {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
+QPushButton#topnav:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
+QPushButton#accent {{
+    background: {PCL_ACCENT};
+    border: 1px solid {PCL_ACCENT};
+    border-radius: 3px;
+    color: #FFFFFF;
+    padding: 7px 14px;
+}}
+QPushButton#accent:hover {{ background: {PCL_ACCENT_HOVER}; border-color: {PCL_ACCENT_HOVER}; }}
+QPushButton#accent:pressed {{ background: {PCL_ACCENT_DARK}; border-color: {PCL_ACCENT_DARK}; padding: 7px 14px; }}
+QPushButton#accent:disabled {{ background: {PCL_ACCENT_LIGHT}; border-color: {PCL_ACCENT_LIGHT}; color: #FFFFFF; }}
+QPushButton#accentBig {{
+    background: {PCL_ACCENT};
+    border: 1px solid {PCL_ACCENT};
+    border-radius: 3px;
+    color: #FFFFFF;
+}}
+QPushButton#accentBig:hover {{ background: {PCL_ACCENT_HOVER}; border-color: {PCL_ACCENT_HOVER}; }}
+QPushButton#accentBig:pressed {{ background: {PCL_ACCENT_DARK}; border-color: {PCL_ACCENT_DARK}; }}
+QPushButton#accentBig:disabled {{ background: {PCL_ACCENT_LIGHT}; border-color: {PCL_ACCENT_LIGHT}; color: #FFFFFF; }}
+QPushButton#danger {{ color: {PCL_RED}; border-color: #F6C6C6; background: #FFFFFF; }}
+QPushButton#danger:hover {{ background: #FBEFEF; border-color: {PCL_RED}; }}
+QPushButton#segment {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    color: {PCL_GRAY2};
+}}
+QPushButton#segment:hover {{ background: {PCL_BG}; color: {PCL_TEXT}; }}
+QPushButton#segment:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
+QPushButton#tile {{
+    background: {PCL_GRAY8};
+    border: 1px solid {PCL_SOFT};
+    border-radius: 6px;
+    color: {PCL_TEXT};
+}}
+QPushButton#tile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
+QPushButton#iconBtn, QPushButton#winBtn, QPushButton#winClose {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+}}
+QPushButton#iconBtn:hover, QPushButton#winBtn:hover {{ background: {PCL_BG}; }}
+QPushButton#iconBtn:pressed, QPushButton#winBtn:pressed {{ background: {PCL_SOFT}; }}
+QPushButton#winClose:hover {{ background: #FBDDDD; }}
+QPushButton#winClose:pressed {{ background: #F6C6C6; }}
+QPushButton#heroMenu {{ color: {PCL_GRAY2}; border-radius: 3px; }}
+QPushButton#heroMenu:hover {{ color: {PCL_ACCENT}; }}
+QComboBox#heroVersion {{ border-radius: 3px; }}
+QLineEdit#heroName:hover {{ background: #FFFFFF; border-color: {PCL_SOFT}; }}
+QLineEdit#heroName:focus {{ background: #FFFFFF; border-color: {PCL_ACCENT}; }}
+QLineEdit, QSpinBox, QComboBox {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 3px;
+}}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {PCL_ACCENT}; }}
+QLineEdit, QSpinBox {{ selection-background-color: {PCL_ACCENT}; }}
+{down_arrow}
+QCheckBox::indicator {{
+    border: 1px solid {PCL_GRAY4};
+    background: #FFFFFF;
+    border-radius: 3px;
+}}
+QCheckBox::indicator:checked {{
+    background: {PCL_ACCENT};
+    border-color: {PCL_ACCENT};
+    {check_icon}
+}}
+QCheckBox::indicator:disabled {{ background: {PCL_GRAY8}; border-color: {PCL_GRAY6}; }}
+QCheckBox::indicator:checked:disabled {{
+    background: {PCL_ACCENT_LIGHT};
+    border-color: {PCL_ACCENT_LIGHT};
+}}
+QListWidget::item:hover, QTreeWidget::item:hover {{ background: {PCL_BG}; }}
+QListWidget::item:selected, QTreeWidget::item:selected {{
+    background: {PCL_SOFT};
+    color: {PCL_ACCENT_DARK};
+}}
+QHeaderView::section {{
+    background: transparent;
+    color: {PCL_GRAY2};
+    border-bottom: 1px solid {PCL_SOFT};
+}}
+QProgressBar {{ background: {PCL_GRAY6}; border-radius: 3px; }}
+QProgressBar::chunk {{ background: {PCL_ACCENT}; border-radius: 3px; }}
+QSlider::groove:horizontal {{ background: {PCL_SOFT}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {PCL_ACCENT}; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    background: #FFFFFF;
+    border: 2px solid {PCL_ACCENT};
+    border-radius: 8px;
+}}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {PCL_GRAY5};
+    border-radius: 3px;
+}}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+    background: {PCL_GRAY4};
+}}
+QPlainTextEdit {{
+    background: #FFFFFF;
+    color: {PCL_GRAY1};
+    border: 1px solid {PCL_SOFT};
+    border-radius: 3px;
+}}
+QMenu {{
+    background: #FFFFFF;
+    border: 1px solid {PCL_SOFT};
+    border-radius: 4px;
+}}
+QMenu::item:selected {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
+QToolTip {{
+    background: #FFFFFF;
+    color: {PCL_TEXT};
+    border: 1px solid {PCL_SOFT};
+    border-radius: 3px;
+    padding: 5px 8px;
+}}
+/* 标题栏：FormMain.xaml PanTitle（ColorObject4 #4890F5，48px） */
+QFrame#pclTopbar {{
+    background: #4890F5;
+    border: none;
+}}
+QLabel#pclBrand {{
+    color: #FFFFFF;
+    font-size: 15pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+QLabel#pclPageTitle {{
+    color: {PCL_BG};
+    font-size: 11pt;
+}}
+QLabel#pclStatus {{ color: #FFFFFF; }}
+QPushButton#pclTopnav {{
+    background: transparent;
+    border: none;
+    border-radius: 13px;
+    color: #FFFFFF;
+    font-size: 9.5pt;
+    padding: 0 12px;
+    min-height: 27px;
+    max-height: 27px;
+}}
+QPushButton#pclTopnav:hover {{ background: rgba(234, 242, 254, 0.20); }}
+QPushButton#pclTopnav:checked {{ background: #FFFFFF; color: {PCL_ACCENT}; }}
+QPushButton#pclTitleBtn {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+}}
+QPushButton#pclTitleBtn:hover {{ background: rgba(255, 255, 255, 0.18); }}
+QPushButton#pclTitleBtn:pressed {{ background: rgba(255, 255, 255, 0.26); }}
+QFrame#pclTopbar QPushButton#winBtn, QFrame#pclTopbar QPushButton#winClose {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+}}
+QFrame#pclTopbar QPushButton#winBtn:hover {{ background: rgba(255, 255, 255, 0.18); }}
+QFrame#pclTopbar QPushButton#winBtn:pressed {{ background: rgba(255, 255, 255, 0.26); }}
+QFrame#pclTopbar QPushButton#winClose:hover {{ background: #E81123; }}
+QFrame#pclTopbar QPushButton#winClose:pressed {{ background: #C50F1F; }}
+/* 登录方式胶囊：PageLaunchLeft PanTypeOne（27px 高、13.5px 圆角） */
+/* 启动页左栏：与右侧留白区分（PCL 的 PanLeft 侧栏底色） */
+QFrame#pclLeftPane {{
+    background: rgba(232, 241, 255, 0.78);
+    border-right: 1px solid rgba(208, 226, 250, 0.95);
+}}
+QWidget#pclHomeRight {{
+    background: #FFFFFF;
+}}
+QFrame#pclPill {{
+    background: rgba(234, 242, 254, 0.45);
+    border: 1px solid rgba(213, 230, 253, 0.9);
+    border-radius: 13px;
+}}
+QLabel#pclPillText {{
+    color: {PCL_TEXT};
+    font-size: 10.5pt;
+    background: transparent;
+}}
+/* 启动按钮：MyButton Highlight（半透明白底 + #0B5BCB 蓝边蓝字，高 54） */
+QPushButton#pclLaunch {{
+    background: rgba(255, 255, 255, 0.33);
+    border: 1px solid {PCL_ACCENT_DARK};
+    border-radius: 3px;
+    color: {PCL_ACCENT_DARK};
+    font-size: 10pt;
+    padding-bottom: 15px;
+}}
+QPushButton#pclLaunch:hover {{
+    background: {PCL_SOFT2};
+    border-color: {PCL_ACCENT};
+}}
+QPushButton#pclLaunch:pressed {{ background: {PCL_SOFT}; }}
+QPushButton#pclLaunch:disabled {{
+    border-color: {PCL_GRAY4};
+    color: {PCL_GRAY4};
+}}
+QLabel#pclLaunchVersion {{
+    color: {PCL_GRAY3};
+    font-size: 8.5pt;
+    background: transparent;
+}}
+/* 普通按钮：MyButton Normal（1px #343D4A 描边 + 半透明白底） */
+QPushButton#pclSmall {{
+    background: rgba(255, 255, 255, 0.33);
+    border: 1px solid {PCL_TEXT};
+    border-radius: 3px;
+    color: {PCL_TEXT};
+    padding: 0 8px;
+}}
+QPushButton#pclSmall:hover {{
+    border-color: {PCL_ACCENT};
+    color: {PCL_ACCENT};
+    background: {PCL_SOFT2};
+}}
+/* 版本下拉与用户名输入：1px 灰边、3px 圆角 */
+QComboBox#pclVersion {{
+    background: rgba(255, 255, 255, 0.92);
+    border: 1px solid {PCL_GRAY5};
+    border-radius: 3px;
+    padding: 0 8px;
+    color: {PCL_GRAY1};
+    font-size: 9.5pt;
+}}
+QComboBox#pclVersion:hover {{ border-color: {PCL_ACCENT}; }}
+QComboBox#pclVersion::drop-down {{ border: none; width: 22px; }}
+QLineEdit#pclName {{
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid {PCL_GRAY5};
+    border-radius: 3px;
+    padding: 0 8px;
+    color: {PCL_GRAY1};
+    font-size: 9.5pt;
+}}
+QLineEdit#pclName:focus {{ border-color: {PCL_ACCENT}; }}
+"""
+
+
+def full_qss(style: str = "default") -> str:
+    """按界面风格返回完整样式表：默认毛玻璃，或叠加 PCL 原版配色。"""
+    return app_qss() + (pcl_qss() if str(style or "").lower() == "pcl" else "")

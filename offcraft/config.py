@@ -16,16 +16,29 @@ SCHEMA = 1
 
 
 def config_dir(explicit: str | Path | None = None) -> Path:
-    """配置目录：显式参数 > OFFCRAFT_DATA > %APPDATA%/OffCraft。"""
+    """配置目录：显式参数 > OFFCRAFT_DATA > ~/.Cr/McDownload。
+
+    旧版本放在 ``%APPDATA%/OffCraft``，首次启动时自动把旧配置搬过来。
+    """
     if explicit:
         return Path(explicit)
     env = os.environ.get("OFFCRAFT_DATA")
     if env:
         return Path(env)
+    target = Path.home() / ".Cr" / "McDownload"
+    legacy = None
     appdata = os.environ.get("APPDATA")
     if appdata:
-        return Path(appdata) / "OffCraft"
-    return Path.home() / ".offcraft"
+        legacy = Path(appdata) / "OffCraft"
+    if legacy is not None and not (target / "config.json").is_file():
+        old = legacy / "config.json"
+        if old.is_file():
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old, target / "config.json")
+            except OSError:
+                pass
+    return target
 
 
 @dataclass
@@ -44,6 +57,12 @@ class Config:
     skip_assets: bool = False
     #: 版本隔离：每个版本使用 ``versions/<id>`` 作为游戏目录（mods/存档/配置互不影响）
     isolation: bool = True
+    #: 是否自动扫描本机其他目录下的 MC 版本（关闭后只显示当前游戏目录里的版本）
+    scan_other_versions: bool = True
+    #: 简洁模式：主界面只保留头像与启动，版本选择与设置收进弹窗
+    simple_mode: bool = False
+    #: 界面风格：``default`` 毛玻璃 / ``pcl`` 复刻原版 PCL2 配色
+    ui_style: str = "default"
     username: str = "Player"
     memory_mb: int = 4096
     width: int = 854
@@ -63,6 +82,9 @@ class Config:
     bg_image: str = ""
     #: 联机：是否允许探听内网/回环服务器（默认关，避免把客户端变成 SSRF 跳板）
     allow_local_servers: bool = False
+    #: 隐私政策：首次下载前需同意的版本号（与 offcraft.privacy.PRIVACY_VERSION 比对）
+    privacy_accepted: bool = False
+    privacy_version: str = ""
     #: 皮肤：是否启用 CSL 自动安装与上传入口
     skin_enabled: bool = True
     #: 皮肤模型：``auto`` 按图片判定 / ``classic`` / ``slim``
@@ -121,6 +143,8 @@ class Config:
             self.skin_model = "auto"
         if self.skin_layout not in ("v1", "v2", "v3"):
             self.skin_layout = "v1"
+        if self.ui_style not in ("default", "pcl"):
+            self.ui_style = "default"
         if self.account_provider not in ("offline", "microsoft"):
             self.account_provider = "offline"
         if not self.username:

@@ -245,10 +245,12 @@ class P2PPanel(QWidget):
 
         self.vpn_check = QCheckBox("虚拟局域网（UDP 直连优先，打洞失败自动中继）")
         self.vpn_check.setChecked(bool(getattr(self.window.config, "p2p_vpn", True)))
-        self.vpn_check.setVisible(
+        if not (
             self._vpn_supported
             and (self._vpn_client is not None or self._vpn_installer is not None)
-        )
+        ):
+            # 还没加入布局时只做隐藏，避免 setVisible(True) 闪出一个独立小窗口
+            self.vpn_check.hide()
         self.vpn_check.stateChanged.connect(self._on_vpn_toggle)
         root.addWidget(self.vpn_check)
 

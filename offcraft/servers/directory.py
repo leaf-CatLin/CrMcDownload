@@ -56,6 +56,8 @@ class ServerListing:
     players_visible: bool = False
     updated_at: float = 0.0
     hot: float = 0.0
+    #: 自己发布的服务器是否在榜（下架后本地仍可见，便于重新上架）
+    visible: bool = True
 
     @property
     def key(self) -> str:
@@ -108,6 +110,7 @@ class ServerListing:
             players_visible=bool(data.get("players_visible")),
             updated_at=float(data.get("updated_at") or 0.0),
             hot=float(data.get("hot") or 0.0),
+            visible=bool(data.get("enabled", True)),
         )
 
 
@@ -147,10 +150,11 @@ class ServerDirectory:
         """单个服务器详情（含历史延迟曲线）。"""
         return self._get("servers/detail", {"host": host, "port": int(port)})
 
-    def report(self, text: str, label: str = "") -> None:
+    def report(self, text: str, label: str = "", owner: str = "") -> dict[str, Any]:
         """把服务器上报到公共榜单；仅供用户手动确认后调用。
 
-        失败时抛出 :class:`DirectoryError`，由界面提示用户（不再静默吞掉）。
+        ``owner`` 是本机生成的管理密钥：服务端只存它的哈希，之后凭它修改 /
+        上下架 / 删除这条记录。返回服务端结果（含 ``owned``）。
         """
         if not self.base:
             raise DirectoryError("未配置下载源，无法上报服务器")
@@ -158,17 +162,46 @@ class ServerDirectory:
             host, port = parse_server(text)
         except ServerAddressError as exc:
             raise DirectoryError(str(exc)) from exc
+        body: dict[str, Any] = {"host": host, "port": port, "label": label or ""}
+        if owner:
+            body["owner"] = owner
+        return self._post("servers/report", body, "上报失败")
+
+    def update(self, host: str, port: int, label: str, owner: str) -> dict[str, Any]:
+        """修改自己上报的服务器备注名。"""
+        return self._post(
+            "servers/update",
+            {"host": host, "port": int(port), "label": label or "", "owner": owner or ""},
+            "修改失败",
+        )
+
+    def set_visible(self, host: str, port: int, visible: bool, owner: str) -> dict[str, Any]:
+        """上架 / 下架自己上报的服务器。"""
+        return self._post(
+            "servers/visibility",
+            {"host": host, "port": int(port), "visible": bool(visible), "owner": owner or ""},
+            "上下架失败",
+        )
+
+    def delete(self, host: str, port: int, owner: str) -> dict[str, Any]:
+        """删除自己上报的服务器。"""
+        return self._post(
+            "servers/delete",
+            {"host": host, "port": int(port), "owner": owner or ""},
+            "删除失败",
+        )
+
+    def _post(self, path: str, body: dict[str, Any], prefix: str) -> dict[str, Any]:
+        if not self.base:
+            raise DirectoryError("未配置下载源，无法提交请求")
         downloader = self.downloader
         if downloader is None:
             raise DirectoryError("下载器不可用")
         try:
-            downloader.request_json(
-                self._url("servers/report"),
-                "POST",
-                body={"host": host, "port": port, "label": label or ""},
-            )
+            data = downloader.request_json(self._url(path), "POST", body=body)
         except DownloadError as exc:
-            raise DirectoryError(f"上报失败：{exc}") from exc
+            raise DirectoryError(f"{prefix}：{exc}") from exc
+        return data if isinstance(data, dict) else {}
 
     def complain(
         self,

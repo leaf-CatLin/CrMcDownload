@@ -34,12 +34,14 @@ class _Downloader:
 
 
 class BuildConfigTests(unittest.TestCase):
-    def test_sourcing_list_points_at_skin(self) -> None:
+    def test_loadlist_points_at_skin_root(self) -> None:
         cfg = csl.build_config("https://mirror.example/")
-        self.assertTrue(cfg["enabled"])
-        self.assertFalse(cfg["checkUpdate"])
-        self.assertIn("https://mirror.example/skin/", cfg["SkinSourcingList"])
-        self.assertTrue(any("%s.png?model={model}" in entry for entry in cfg["SkinSourcingList"]))
+        self.assertTrue(cfg["enable"])
+        entries = cfg["loadlist"]
+        first = entries[0]
+        self.assertEqual(first["type"], "CustomSkinAPI")
+        self.assertEqual(first["root"], "https://mirror.example/")
+        self.assertEqual(entries[1]["type"], "MojangAPI")
 
 
 class EnsureInstalledTests(unittest.TestCase):
@@ -75,7 +77,12 @@ class EnsureInstalledTests(unittest.TestCase):
         self.assertTrue(status.config_written)
         self.assertTrue(status.ready)
         self.assertEqual(downloader.downloaded, [])  # 已存在不再下载
-        written = json.loads((mods / csl.CSL_CONFIG_NAME).read_text(encoding="utf-8"))
+        config_path = csl.config_path_for(self.mc, _instance())
+        self.assertEqual(
+            config_path,
+            self.mc / "versions" / "1.20.4-fabric" / "CustomSkinLoader" / "CustomSkinLoader.json",
+        )
+        written = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertEqual(written, csl.build_config("https://m.example"))
 
     def test_install_success(self) -> None:
