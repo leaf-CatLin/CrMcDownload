@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import hmac
 import json
 import mimetypes
 import os
@@ -230,7 +231,10 @@ class MirrorHandler(BaseHTTPRequestHandler):
             return True
         if self.path in ("/health", "/metrics"):
             return True
-        return self.headers.get("X-OffCraft-Token", "") == token
+        # 恒定时间比较，避免对令牌做基于内容的时序侧信道探测。
+        supplied = (self.headers.get("X-OffCraft-Token") or "").encode("utf-8", "replace")
+        expected = token.encode("utf-8", "replace")
+        return hmac.compare_digest(supplied, expected)
 
     # ----------------------------------------------------------- local file
     def _serve_file(self, path: Path, head_only: bool, immutable: bool) -> None:
@@ -322,6 +326,7 @@ class MirrorHandler(BaseHTTPRequestHandler):
         conn = None
         tmp_path: Path | None = None
         fh = None
+        sent_headers = False
         try:
             conn = open_upstream(upstream_url, self.server.settings.proxy, timeout=30)
             conn.request("GET", _path_of(upstream_url), headers=headers)
@@ -347,20 +352,26 @@ class MirrorHandler(BaseHTTPRequestHandler):
 
             length = resp.getheader("Content-Length")
             self.send_response(resp.status)
-            self.send_header("Content-Type", resp.getheader("Content-Type") or self._content_type(cache_path))
+            self.send_header(
+                "Content-Type",
+                self._sanitize_header(resp.getheader("Content-Type")) or self._content_type(cache_path),
+            )
             if length is not None:
                 self.send_header("Content-Length", length)
             self.send_header("Accept-Ranges", "bytes")
             for name in ("ETag", "Last-Modified"):
                 value = resp.getheader(name)
                 if value:
-                    self.send_header(name, value)
+                    # 上游是被动可信源：其返回的头若被污染（含 CR/LF）会注入到
+                    # 我们自己的响应头里，必须清洗后再发送。
+                    self.send_header(name, self._sanitize_header(value) or "")
             immutable = not is_metadata(route.prefix, route.relative)
             self.send_header(
                 "Cache-Control",
                 "public, max-age=31536000, immutable" if immutable else "public, max-age=600",
             )
             self.end_headers()
+            sent_headers = True
 
             if head_only:
                 return
@@ -416,10 +427,18 @@ class MirrorHandler(BaseHTTPRequestHandler):
                     tmp_path = None
         except (OSError, http.client.HTTPException) as exc:
             self.server.metrics.error()
-            try:
-                self._json(502, {"error": f"upstream error: {exc}"})
-            except OSError:
-                pass
+            if sent_headers:
+                # 响应头已发给客户端（可能已在传输 body）：此刻不能再发第二份
+                # 状态/头，否则会产生「头嵌在 body 后」的损坏响应。直接断开连接，
+                # 让客户端感知传输中断并重试。
+                self.close_connection = True
+                if os.environ.get("MIRROR_VERBOSE"):
+                    print(f"[mirror] upstream error mid-stream: {exc}", flush=True)
+            else:
+                try:
+                    self._json(502, {"error": f"upstream error: {exc}"})
+                except OSError:
+                    pass
         finally:
             if fh is not None:
                 try:
@@ -432,6 +451,13 @@ class MirrorHandler(BaseHTTPRequestHandler):
                 conn.close()
 
     # --------------------------------------------------------------- output
+    @staticmethod
+    def _sanitize_header(value: str | None) -> str:
+        """去掉会污染响应头的控制字符。"""
+        if value is None:
+            return ""
+        return "".join(ch for ch in value if ch >= " " and ch != "\x7f").strip()
+
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)

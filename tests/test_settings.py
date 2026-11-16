@@ -49,3 +49,28 @@ def test_prepare_creates_all_directories(tmp_path):
     assert settings.plugin_dir.is_dir()
     # 幂等
     settings.prepare()
+
+
+def test_host_port_ipv4():
+    settings = Settings(listen="127.0.0.1:8081")
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 8081
+
+
+def test_host_port_ipv6_bracketed():
+    settings = Settings(listen="[::1]:8081")
+    assert settings.host == "::1"
+    assert settings.port == 8081
+
+
+def test_host_port_ipv6_multi_colon_bracketed():
+    settings = Settings(listen="[2001:db8::1]:443")
+    assert settings.host == "2001:db8::1"
+    assert settings.port == 443
+
+
+def test_host_bare_ipv6_no_brackets_returns_full_address():
+    # 裸 IPv6（未加括号）无法拆出端口，应把整串作为 host、端口回落 0，而不是截坏地址
+    settings = Settings(listen="fe80::1")
+    assert settings.host == "fe80::1"
+    assert settings.port == 0

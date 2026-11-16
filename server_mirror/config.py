@@ -217,8 +217,24 @@ class Settings:
 
     @property
     def host(self) -> str:
-        return self.listen.rsplit(":", 1)[0]
+        """监听主机名/IP。IPv6 地址允许带方括号（如 ``[::1]:8081``），返回去括号后的地址。"""
+        addr = self.listen
+        if addr.startswith("[") and "]" in addr:
+            return addr[1:].split("]", 1)[0]
+        # ``host:port`` 形式：用 ``rsplit`` 取最后一段作为端口，主机在它之前。
+        # 注意原实现用 ``rsplit(":", 1)[0]``，对含冒号的 IPv6 裸地址会截错，
+        # 这里在拆端口前先判断是否属于带括号的 IPv6 字面量。
+        if addr.count(":") == 1:
+            return addr.rsplit(":", 1)[0]
+        return addr
 
     @property
     def port(self) -> int:
-        return int(self.listen.rsplit(":", 1)[1])
+        addr = self.listen
+        if addr.startswith("[") and "]" in addr:
+            _, _, rest = addr.partition("]:")
+            return int(rest or "0")
+        if addr.count(":") == 1:
+            return int(addr.rsplit(":", 1)[1])
+        # 含多个冒号且未加括号 → 视为裸 IPv6，端口缺失，回退 0
+        return 0
