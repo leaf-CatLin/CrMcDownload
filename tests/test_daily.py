@@ -8,6 +8,7 @@ from offcraft.daily import (
     FALLBACK,
     Sentence,
     cache_path,
+    fetch_sentence,
     load_cached,
     parse_payload,
     store_cached,
@@ -92,6 +93,12 @@ class DailySentenceTest(unittest.TestCase):
             self.assertEqual(sentence.text, "戏会落幕，人生却不会。")
             self.assertEqual(sentence.author, "云堇")
             self.assertEqual(sentence.work, "原神")
+
+    def test_fetch_sentence_all_three_endpoints_fail_returns_fallback(self):
+        # 直调用 fetch_sentence：即使 JSON、full、纯文本三段都失败，
+        # 也应该静默返回内置文案而不是向上抛异常。
+        stub = _StubDownloader(fail_json=True, fail_text=True)
+        self.assertEqual(fetch_sentence(stub), FALLBACK)
 
 
 def _today() -> str:

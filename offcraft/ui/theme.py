@@ -762,15 +762,11 @@ def pcl_qss() -> str:
     )
     return f"""
 QWidget {{ color: {PCL_TEXT}; }}
-/* 主窗口背景由 Backdrop 绘制（含 PCL 圆角外壳），这里必须透明 */
+/* 主窗口背景由 Backdrop 绘制，这里必须透明 */
 QMainWindow {{ background: transparent; }}
 QDialog {{
     background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
         stop:0 #FFFFFF, stop:0.55 #F3F8FF, stop:1 {PCL_BG});
-}}
-QFrame#pclTopbar[shell="true"] {{
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
 }}
 QFrame#topbar {{
     background: #FFFFFF;
@@ -993,9 +989,8 @@ QFrame#pclTopbar {{
 }}
 QLabel#pclBrand {{
     color: #FFFFFF;
-    font-size: 15pt;
+    font-size: 12pt;
     font-weight: 700;
-    letter-spacing: 1px;
 }}
 QLabel#pclPageTitle {{
     color: {PCL_BG};

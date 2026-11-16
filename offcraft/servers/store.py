@@ -69,9 +69,15 @@ class ServerEntry:
             parsed_host, parsed_port = parse_server(text)
         except ServerAddressError:
             parsed_host, parsed_port = host or text, DEFAULT_PORT
+        # ``port`` 历史数据里可能是非数字字符串，容忍并回退到解析值/默认值
+        raw_port = data.get("port")
+        try:
+            port = int(raw_port) if raw_port not in (None, "") else parsed_port
+        except (TypeError, ValueError):
+            port = parsed_port
         return cls(
             host=str(data.get("host") or parsed_host).strip().lower(),
-            port=int(data.get("port") or parsed_port),
+            port=port,
             label=str(data.get("label") or ""),
             added_at=float(data.get("added_at") or 0.0),
         )

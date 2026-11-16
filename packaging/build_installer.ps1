@@ -30,6 +30,26 @@ function Get-AppVersion {
     return $m.Groups[1].Value
 }
 
+# License texts: EULA is a static file in installer/; the privacy policy body is
+# shared with the client (offcraft/privacy.py, policy_text()) and is dumped to a
+# plain-text file by python, then embedded as a resource in the setup executable.
+function New-PrivacyText {
+    param([string]$OutPath)
+    $py = Join-Path $root 'offcraft\privacy.py'
+    $code = @'
+import sys
+sys.path.insert(0, r"{ROOT}")
+from offcraft.privacy import policy_text
+sys.stdout.buffer.write(policy_text().encode("utf-8"))
+'@
+    $code = $code.Replace('{ROOT}', $root)
+    $tmpPy = Join-Path $env:TEMP 'crmc-privacy-dump.py'
+    [System.IO.File]::WriteAllText($tmpPy, $code, (New-Object System.Text.UTF8Encoding($true)))
+    & python $tmpPy | Out-File -FilePath $OutPath -Encoding utf8
+    Remove-Item $tmpPy -ErrorAction SilentlyContinue
+    if (-not (Test-Path $OutPath)) { throw "failed to generate privacy text" }
+}
+
 $Version = Get-AppVersion
 $p = $Version.Split('.')
 while ($p.Length -lt 4) { $p += '0' }
@@ -107,6 +127,17 @@ $cscCommon = @(
     '/r:System.IO.Compression.FileSystem.dll'
 )
 
+# License resources: static EULA + generated privacy policy text.
+$eulaSrc = Join-Path $here 'installer\EULA.txt'
+if (-not (Test-Path $eulaSrc)) { throw "missing $eulaSrc" }
+$privacyTxt = Join-Path $buildDir 'PRIVACY.txt'
+New-PrivacyText -OutPath $privacyTxt
+
+$cscResources = @(
+    ('/resource:' + $eulaSrc + ',EULA.txt'),
+    ('/resource:' + $privacyTxt + ',PRIVACY.txt')
+)
+
 Write-Host '[3/4] compiling uninstaller.exe'
 $unExe = Join-Path $buildDir 'uninstaller.exe'
 & $csc ($cscCommon + @('/define:UNINSTALLER', ('/out:' + $unExe), $setupSrc, $biPath))
@@ -116,7 +147,7 @@ Write-Host '[4/4] compiling setup.exe'
 $outDir = Join-Path $root 'dist\installer'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $outExe = Join-Path $outDir ("CrMCDownload-$Version-win64-setup.exe")
-& $csc ($cscCommon + @(
+& $csc ($cscCommon + $cscResources + @(
     ('/out:' + $outExe),
     ('/resource:' + $payload + ',payload.zip'),
     ('/resource:' + $unExe + ',uninstaller.exe'),

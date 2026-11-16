@@ -12,6 +12,7 @@ from offcraft.content.loader import (
     LOADERS,
     LoaderError,
     _neoforge_prefix,
+    _verify_installer_jar,
     install_loader,
     installer_version_id,
     list_loader_versions,
@@ -245,6 +246,25 @@ class LoaderDependencyTest(unittest.TestCase):
             self.assertEqual(tasks, [])
             self.assertEqual(warnings, [])
             self.assertEqual(installer_version_id(jar), "")
+
+    def test_verify_installer_jar_accepts_valid_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = _write_installer(Path(tmp) / "forge-installer.jar", "26.2-forge-65.1.5")
+            self.assertTrue(_verify_installer_jar(jar, loader="forge"))
+
+    def test_verify_installer_jar_rejects_garbage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "bad.jar"
+            jar.write_bytes(b"this is definitely not a zip archive")
+            self.assertFalse(_verify_installer_jar(jar, loader="forge"))
+
+    def test_verify_installer_jar_rejects_missing_version_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "partial.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("install_profile.json", "{}")
+                archive.writestr("random.txt", "hi")
+            self.assertFalse(_verify_installer_jar(jar, loader="forge"))
 
 
 if __name__ == "__main__":

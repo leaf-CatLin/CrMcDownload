@@ -490,14 +490,21 @@ class OnlinePage(QWidget):
         self.status_label.setText("正在刷新……")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
+    def _end_refresh(self, message: str = " ") -> None:
+        """只在 UI 线程执行，统一清刷新态。"""
+        self._refreshing = False
+        self.status_label.setText(message)
+
     def _refresh_worker(self) -> None:
+        # ``_refreshing`` 只在 UI 线程读写：后台线程结束时通过 window.post 回 UI 复位，
+        # 避免线程间裸读写导致漏复位或和新一轮刷新互相覆盖。
         section = self._section
         query = self.search.text().strip() if section == "hot" else ""
         allow_local = bool(getattr(self.window.config, "allow_local_servers", False))
         try:
             if section == "hot":
                 hits, _total = self._directory().list(query, limit=30)
-                self.window.post(lambda: self._apply_hot(hits))
+                self.window.post(lambda h=hits: self._apply_hot(h))
                 return
             if section == "published":
                 entries = []
@@ -526,19 +533,14 @@ class OnlinePage(QWidget):
                 fav = entry.key in favs
                 icon = self._icons.get(entry.key)
                 self.window.post(lambda l=listing, f=fav, i=icon: self._update_card(l, f, i))
-        except DirectoryError as exc:
-            message = str(exc)
-            self.window.post(lambda m=message: self.status_label.setText(m))
+            self.window.post(self._end_refresh)
         except Exception as exc:  # noqa: BLE001 - 后台线程兜底
-            message = f"刷新失败：{exc}"
-            self.window.post(lambda m=message: self.status_label.setText(m))
-        finally:
-            self._refreshing = False
+            message = str(exc) if isinstance(exc, DirectoryError) else f"刷新失败：{exc}"
+            self.window.post(lambda m=message: self._end_refresh(m))
 
     def _apply_hot(self, hits: list[ServerListing]) -> None:
         self._hot = hits
-        self._refreshing = False
-        self.status_label.setText(" ")
+        self._end_refresh()
         if self._section == "hot":
             self._rebuild()
 

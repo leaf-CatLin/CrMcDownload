@@ -97,7 +97,7 @@ def parse_payload(payload: Any) -> Sentence:
 
 
 def fetch_sentence(downloader: Any) -> Sentence:
-    """优先 JSON 接口（字段可靠），失败后回退到 full 纯文本。"""
+    """优先 JSON 接口（字段可靠），失败后回退到 full 纯文本，再回退到极简单行。"""
     try:
         return parse_payload(downloader.fetch_json(API_JSON))
     except Exception:  # noqa: BLE001 - 任何网络/解析失败都走文本兜底
@@ -106,7 +106,12 @@ def fetch_sentence(downloader: Any) -> Sentence:
         raw = downloader.fetch_bytes(API_FULL, max_size=8 * 1024)
         return parse_payload(raw)
     except Exception:  # noqa: BLE001
-        return parse_payload(downloader.fetch_bytes(API_TEXT, max_size=8 * 1024))
+        pass
+    try:
+        raw = downloader.fetch_bytes(API_TEXT, max_size=8 * 1024)
+        return parse_payload(raw)
+    except Exception:  # noqa: BLE001 - 全部远端失败时兜底内置文案
+        return FALLBACK
 
 
 def cache_path(data_dir: str | Path, day: str | None = None) -> Path:
@@ -147,8 +152,9 @@ def today_sentence(data_dir: str | Path, downloader: Any | None = None) -> Sente
         sentence = fetch_sentence(downloader)
     except Exception:  # noqa: BLE001
         return FALLBACK
-    if not sentence.text.strip():
-        return FALLBACK
+    if not sentence.text.strip() or sentence is FALLBACK:
+        # 远端全部失败兜底的内置文案不要写进当天缓存，否则会把「离线」状态固化一天。
+        return sentence
     try:
         store_cached(data_dir, sentence)
     except OSError:

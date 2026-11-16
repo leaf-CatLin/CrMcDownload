@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from offcraft.install.plan import maven_path, maven_path_with_classifier
-from offcraft.meta.rules import OsInfo, is_allowed
+from offcraft.meta.rules import OsInfo, is_allowed, native_classifier
 from offcraft.meta.version import MergedVersion
 
 __all__ = ["ClasspathPlan", "build_classpath", "native_jar_paths"]
@@ -66,7 +66,7 @@ def _iter_natives(
     for library in version.libraries:
         if not is_allowed(library.get("rules"), os_info, features):
             continue
-        classifier = (library.get("natives") or {}).get("windows")
+        classifier = native_classifier(library, os_info)
         if not classifier:
             continue
         relative = _native_path(library, classifier)
@@ -110,18 +110,19 @@ def build_classpath(
             if not path.is_file():
                 plan.missing.append(path)
 
-        classifier = (library.get("natives") or {}).get("windows")
-        if classifier:
-            native_relative = _native_path(library, classifier)
-            if native_relative is None:
-                plan.warnings.append(
-                    f"无法确定 natives 路径：{library.get('name')!r} ({classifier})"
-                )
-                continue
-            native_path = libraries_dir / native_relative
-            plan.native_jars.append(native_path)
-            if not native_path.is_file():
-                plan.missing.append(native_path)
+        classifier = native_classifier(library, os_info)
+        if not classifier:
+            continue
+        native_relative = _native_path(library, classifier)
+        if native_relative is None:
+            plan.warnings.append(
+                f"无法确定 natives 路径：{library.get('name')!r} ({classifier})"
+            )
+            continue
+        native_path = libraries_dir / native_relative
+        plan.native_jars.append(native_path)
+        if not native_path.is_file():
+            plan.missing.append(native_path)
 
     jar_id = version.jar_id
     jar_path = mc_dir / "versions" / jar_id / f"{jar_id}.jar"

@@ -165,7 +165,7 @@ from offcraft.ui.theme import (
     human_size,
     initial_pixmap,
 )
-from offcraft.ui.widgets import Badge, Card, ElidedLabel, Tile, ComboPolisher, polish_combo
+from offcraft.ui.widgets import Badge, Card, Combo, ElidedLabel, Tile, ComboPolisher, polish_combo
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
@@ -1258,25 +1258,17 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._rebuild_layout)
 
     def _apply_shell(self) -> None:
-        """PCL 风格：窗口外留 18px 阴影区，内容收进 6px 圆角卡片（最大化时取消）。"""
+        """窗口铺满整个客户区（PCL 风格不再保留外侧透明阴影留白）。"""
         if not hasattr(self, "_root_layout") or not hasattr(self, "backdrop"):
             return
-        shell = self._pcl() and not self.isMaximized() and not self.isFullScreen()
-        inset = 18 if shell else 0
-        self._shell_inset = inset
+        self._shell_inset = 0
         # 默认风格需要不透明底，避免半透明窗口首帧露出白底；PCL 风格必须保持透明
         self.setAutoFillBackground(not self._pcl())
         if not self._pcl():
             palette = self.palette()
             palette.setColor(QPalette.ColorRole.Window, QColor("#F2F6FC"))
             self.setPalette(palette)
-        self.backdrop.set_shell(shell, 18, 6)
-        self._root_layout.setContentsMargins(inset, inset, inset, inset)
-        bar = getattr(self, "topbar", None)
-        if bar is not None:
-            bar.setProperty("shell", "true" if shell else "false")
-            bar.style().unpolish(bar)
-            bar.style().polish(bar)
+        self._root_layout.setContentsMargins(0, 0, 0, 0)
         self._place_overlays()
 
     def _rebuild_layout(self) -> None:
@@ -1478,15 +1470,26 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(2, 1)
 
-        # 左：PCL 白色 logo（子页面时整体换成「返回箭头 + 页面名」）
+        # 左：本程序 logo（子页面时整体换成「返回箭头 + 页面名」）
         left = QWidget()
         left_row = QHBoxLayout(left)
         left_row.setContentsMargins(0, 0, 0, 0)
         left_row.setSpacing(4)
-        self.brand_logo = QLabel("PCL")
-        self.brand_logo.setObjectName("pclBrand")
-        self.brand_logo.setToolTip(APP_NAME)
-        left_row.addWidget(self.brand_logo)
+
+        brand = QWidget()
+        self.brand_logo = brand
+        brand_row = QHBoxLayout(brand)
+        brand_row.setContentsMargins(0, 0, 0, 0)
+        brand_row.setSpacing(8)
+        mark = QLabel()
+        mark.setFixedSize(26, 26)
+        mark.setPixmap(block_pixmap("crmcdownload", 26))
+        brand_row.addWidget(mark)
+        name = QLabel(APP_NAME)
+        name.setObjectName("pclBrand")
+        brand_row.addWidget(name)
+        brand.setToolTip(APP_NAME)
+        left_row.addWidget(brand)
 
         self.back_button = QPushButton()
         self.back_button.setObjectName("pclTitleBtn")
@@ -1878,9 +1881,9 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, u(0.75))
         row.setSpacing(u(0.75))
 
-        self.version_combo = QComboBox()
+        self.version_combo = Combo()
         self.version_combo.setObjectName("heroVersion")
-        self.version_combo.setMinimumWidth(u(17))
+        self.version_combo.setMinimumWidth(u(17) + 10)
         self.version_combo.setFixedHeight(u(3.5))
         self.version_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.version_combo.setToolTip("当前版本：点击下拉切换")
@@ -1970,7 +1973,7 @@ class MainWindow(QMainWindow):
         column.addSpacing(14)
         version_row = QHBoxLayout()
         version_row.setSpacing(12)
-        self.version_combo = QComboBox()
+        self.version_combo = Combo()
         self.version_combo.setObjectName("pclVersion")
         self.version_combo.setMinimumWidth(u(9))
         self.version_combo.setSizeAdjustPolicy(
@@ -3997,8 +4000,8 @@ class MainWindow(QMainWindow):
 
         def add_item(item: Instance, *, secondary: bool) -> None:
             loader = item.loader or "原版"
-            # 名称超过 10 个字符就省略，配合 AdjustToContents 让下拉框自适应宽度
-            name = item.id if len(item.id) <= 10 else item.id[:10] + "…"
+            # 不预截断名称：显示宽度不足时由 QComboBox 自行省略，避免把常见名字截成 "…"
+            name = item.id
             label = name if loader in ("原版", "未知") else f"{name} · {loader}"
             if secondary:
                 label += f" · {Path(item.root).name or item.root}"
@@ -4048,6 +4051,7 @@ class MainWindow(QMainWindow):
 
         current = self.version_combo.currentData() if target >= 0 else None
         self.selected = current if isinstance(current, Instance) else None
+        self._fit_version_combo()
         self._update_hero()
 
         total = sum(item.size_bytes for item in self.instances)
@@ -4056,12 +4060,21 @@ class MainWindow(QMainWindow):
             self.status(f"{len(self.instances)} 个实例 · {human_size(total)}{extra}")
         self._render_versions()
 
+    def _fit_version_combo(self) -> None:
+        """按当前条目文字扩展下拉框最小宽度，避免文字被下拉箭头遮住。"""
+        combo = getattr(self, "version_combo", None)
+        if combo is None or sip.isdeleted(combo) or self._pcl():
+            return
+        needed = combo.fontMetrics().horizontalAdvance(combo.currentText()) + 64
+        combo.setMinimumWidth(max(u(17) + 10, min(needed, u(30))))
+
     def _on_version_selected(self, index: int) -> None:
         instance = self.version_combo.itemData(index) if index >= 0 else None
         if not isinstance(instance, Instance):
             return
         self.selected = instance
         self.config.last_version = instance.id
+        self._fit_version_combo()
         self._update_hero()
 
     def _update_hero(self) -> None:

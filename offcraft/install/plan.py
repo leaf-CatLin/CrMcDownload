@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from offcraft.mirror import Mirror
-from offcraft.meta.rules import OsInfo, is_allowed
+from offcraft.meta.rules import OsInfo, is_allowed, native_classifier
 from offcraft.meta.version import MergedVersion
 from offcraft.net.downloader import DownloadTask
 
@@ -171,7 +171,8 @@ def _add_library(
     )
 
     natives = library.get("natives") or {}
-    classifier = natives.get("windows")
+    # 按当前平台 + 架构选 natives 分类器（Windows 上 arm64 会取 natives-windows-arm64）
+    classifier = native_classifier(library, os_info) if natives else None
     if not classifier or not options.include_natives:
         return
     classifiers = downloads.get("classifiers") or {}

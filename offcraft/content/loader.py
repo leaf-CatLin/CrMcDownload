@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import threading
@@ -314,19 +315,44 @@ def _download(
     *,
     cancel=None,
     label: str = "",
+    sha1: str | None = None,
 ) -> bool:
-    """镜像优先下载单个文件，失败回退官方源；已存在且大小一致则跳过。"""
+    """镜像优先下载单个文件，失败回退官方源。
+
+    提供 ``sha1`` 时，已存在的缓存文件也先校验指纹（避免复用上一次的坏文件），
+    指纹不符则重新下载；DownloadTask 下载过程中同样会做 sha1 校验。
+    """
     if dest.is_file() and dest.stat().st_size > 0:
-        return True
+        if not sha1 or _file_sha1(dest) == _norm_sha1(sha1):
+            return True
     for candidate in _candidates(mirror, url):
         report = downloader.run(
-            [DownloadTask(url=candidate, dest=dest, label=label)],
+            [DownloadTask(url=candidate, dest=dest, label=label, sha1=sha1)],
             tracker=ProgressTracker(),
             cancel=cancel,
         )
         if report.ok and dest.is_file() and dest.stat().st_size > 0:
             return True
     return False
+
+
+def _norm_sha1(sha1: str | None) -> str | None:
+    return sha1.strip().lower() if sha1 else None
+
+
+def _file_sha1(path: Path) -> str | None:
+    """计算文件 SHA-1；读取失败返回 None（调用方据此视为「无法校验」）。"""
+    try:
+        digest = hashlib.sha1()
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _version_dirs(mc_dir: Path) -> set[str]:
@@ -411,6 +437,27 @@ def _zip_json(jar: Path, name: str) -> dict:
             return json.loads(archive.read(name).decode("utf-8", errors="replace"))
     except (KeyError, OSError, ValueError, zipfile.BadZipFile):
         return {}
+
+
+def _verify_installer_jar(jar: Path, *, loader: str) -> bool:
+    """校验安装器 jar 是一个可读的 ZIP 且内含预期的描述文件。
+
+    Forge / NeoForge 的安装器在 Maven 上不暴露 SHA-1，无法做外部指纹比对；
+    这里退而求其次做自洽校验：能正常 list 且能读出版本描述，即可基本排除
+    网络损坏/截断导致的「半个 jar」。校验失败时调用方应删除并重下。
+    """
+    try:
+        with zipfile.ZipFile(jar) as archive:
+            if archive.testzip() is not None:
+                return False
+            names = set(archive.namelist())
+            # 后续 ``installer_version_id`` 要从 jar 里读 version.json，
+            # 缺了它说明文件错配/截断，直接判失败。
+            if VERSION_ENTRY not in names:
+                return False
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return True
 
 
 def installer_version_id(jar: Path | str) -> str:
@@ -583,6 +630,13 @@ def install_loader(
             mirror, downloader, url, jar, cancel=cancel, label=name
         ):
             raise LoaderError(f"{loader} 安装器下载失败")
+        if not _verify_installer_jar(jar, loader=key):
+            # 安装器损坏/截断：清掉旧文件，让下次重新下载
+            try:
+                jar.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise LoaderError(f"{loader} 安装器文件损坏，请重试")
         java_path = _pick_java(mc_dir, java)
         # 关键：先把安装器自己（install_profile）与版本 JSON 里的依赖全部经镜像备齐。
         # 否则安装器会自己去官方 maven 拉，本机经常超时卡住、退出码却是 0，

@@ -1,6 +1,6 @@
 import unittest
 
-from offcraft.meta.rules import OsInfo, is_allowed, rule_matches
+from offcraft.meta.rules import OsInfo, is_allowed, native_classifier, rule_matches
 
 
 WIN = OsInfo("windows", "10.0.19045", "x86_64")
@@ -45,6 +45,33 @@ class RulesTest(unittest.TestCase):
 
     def test_rule_matches_without_conditions(self) -> None:
         self.assertTrue(rule_matches({}, WIN))
+
+    # --- natives 分类器（架构相关） ---
+    def test_native_classifier_default_windows(self) -> None:
+        lib = {"natives": {"windows": "natives-windows", "linux": "natives-linux"}}
+        self.assertEqual(native_classifier(lib, WIN), "natives-windows")
+
+    def test_native_classifier_arm64_prefers_arch_specific(self) -> None:
+        lib = {"natives": {"windows": "natives-windows", "windows-arm64": "natives-windows-arm64"}}
+        arm = OsInfo("windows", "10.0", "arm64")
+        self.assertEqual(native_classifier(lib, arm), "natives-windows-arm64")
+        self.assertEqual(native_classifier(lib, WIN), "natives-windows")
+
+    def test_native_classifier_osx(self) -> None:
+        lib = {"natives": {"osx": "natives-osx", "osx-arm64": "natives-macos-arm64"}}
+        self.assertEqual(native_classifier(lib, OsInfo("osx", "14.0", "x86_64")), "natives-osx")
+        self.assertEqual(
+            native_classifier(lib, OsInfo("osx", "14.0", "arm64")), "natives-macos-arm64"
+        )
+
+    def test_native_classifier_absent_returns_none(self) -> None:
+        self.assertIsNone(native_classifier({}, WIN))
+        self.assertIsNone(native_classifier({"natives": {"linux": "x"}}, WIN))
+
+    def test_arm64_rule_matches(self) -> None:
+        rules = [{"action": "allow", "os": {"name": "osx", "arch": "arm64"}}]
+        self.assertTrue(is_allowed(rules, OsInfo("osx", "14.0", "arm64")))
+        self.assertFalse(is_allowed(rules, OsInfo("osx", "14.0", "x86_64")))
 
 
 if __name__ == "__main__":

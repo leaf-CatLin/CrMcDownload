@@ -26,6 +26,15 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(ServerEntry("a.example.com", 25566, "备注").name, "备注")
         self.assertEqual(ServerEntry("a.example.com", 25566).name, "a.example.com:25566")
 
+    def test_from_json_non_numeric_port_tolerated(self) -> None:
+        entry = ServerEntry.from_json({"host": "mc.example.com", "port": "not-a-number"})
+        self.assertEqual(entry.host, "mc.example.com")
+        self.assertEqual(entry.port, 25565)
+
+    def test_from_json_numeric_port_used(self) -> None:
+        entry = ServerEntry.from_json({"host": "mc.example.com", "port": 25566})
+        self.assertEqual(entry.port, 25566)
+
 
 class StoreTests(StoreTestCase):
     def test_add_dedupe_and_rename(self) -> None:

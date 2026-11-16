@@ -23,6 +23,8 @@ namespace CrMcSetup
         internal const string UninstallExe = "uninstall.exe";
         internal const string PayloadResource = "payload.zip";
         internal const string UninstallerResource = "uninstaller.exe";
+        internal const string EulaResource = "EULA.txt";
+        internal const string PrivacyResource = "PRIVACY.txt";
         internal const string ArpKey =
             @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CrMCDownload";
 
@@ -112,7 +114,6 @@ namespace CrMcSetup
                     ? DoUninstall(null, false)
                     : DoInstall(null, DesktopIcon, LaunchApp, false);
             }
-
             // 双击运行时先把“环境不让写 C 盘”这类问题摆在面前，
             // 而不是让用户点完「安装」才看到报错。
             if (!UninstallMode)
@@ -237,6 +238,25 @@ namespace CrMcSetup
         {
             AppendLog("setup-trace.log",
                 DateTime.Now.ToString("HH:mm:ss.fff") + "  " + text + Environment.NewLine);
+        }
+
+        internal static string LoadText(string resource)
+        {
+            try
+            {
+                using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource))
+                {
+                    if (s == null) return "";
+                    using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+                    {
+                        return r.ReadToEnd();
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return "";
+            }
         }
 
         internal static string LogDir
@@ -638,8 +658,11 @@ namespace CrMcSetup
         private readonly bool _uninstall;
         private readonly Label _title;
         private readonly Label _sub;
+        private readonly Label _pathBox;
         private readonly ProgressBar _bar;
         private readonly CheckBox _desktop;
+        private readonly CheckBox _agreeEula;
+        private readonly CheckBox _agreePrivacy;
         private readonly Button _primary;
         private readonly Button _secondary;
         private bool _done;
@@ -649,7 +672,7 @@ namespace CrMcSetup
             _uninstall = uninstall;
             Text = BuildInfo.Name + " " + BuildInfo.Version +
                    (uninstall ? " 卸载程序" : " 安装程序");
-            ClientSize = new Size(560, 276);
+            ClientSize = new Size(560, uninstall ? 276 : 400);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -675,12 +698,19 @@ namespace CrMcSetup
             cap.SetBounds(26, 92, 500, 20);
             Controls.Add(cap);
 
-            Label pathBox = new Label();
-            pathBox.Text = Program.TargetDir;
-            pathBox.AutoEllipsis = true;
-            pathBox.SetBounds(26, 112, 508, 22);
-            pathBox.ForeColor = Color.FromArgb(40, 44, 56);
-            Controls.Add(pathBox);
+            _pathBox = new Label();
+            _pathBox.Text = Program.TargetDir;
+            _pathBox.AutoEllipsis = true;
+            _pathBox.SetBounds(26, 112, 408, 22);
+            _pathBox.ForeColor = Color.FromArgb(40, 44, 56);
+            Controls.Add(_pathBox);
+
+            Button browse = new Button();
+            browse.Text = "更改…";
+            browse.SetBounds(440, 108, 96, 28);
+            browse.Visible = !uninstall;
+            browse.Click += OnBrowse;
+            Controls.Add(browse);
 
             _bar = new ProgressBar();
             _bar.SetBounds(24, 152, 512, 14);
@@ -707,8 +737,94 @@ namespace CrMcSetup
             _secondary.Click += OnSecondary;
             Controls.Add(_secondary);
 
-            AcceptButton = _primary;
+            if (uninstall)
+            {
+                AcceptButton = _primary;
+                CancelButton = _secondary;
+                return;
+            }
+
+            // 安装模式：底部放置协议勾选 + 安装/取消按钮
+            _primary.SetBounds(340, 356, 90, 30);
+            _secondary.SetBounds(440, 356, 90, 30);
+
+            _agreeEula = new CheckBox();
+            _agreeEula.SetBounds(24, 222, 340, 22);
+            _agreeEula.CheckedChanged += OnAgreeChanged;
+            Controls.Add(_agreeEula);
+
+            Button viewEula = new Button();
+            viewEula.Text = "查看《用户协议》";
+            viewEula.SetBounds(370, 220, 166, 26);
+            viewEula.Click += delegate { ShowAgreement("《用户协议》", Program.EulaResource); };
+            Controls.Add(viewEula);
+
+            _agreePrivacy = new CheckBox();
+            _agreePrivacy.SetBounds(24, 256, 340, 22);
+            _agreePrivacy.CheckedChanged += OnAgreeChanged;
+            Controls.Add(_agreePrivacy);
+
+            Button viewPrivacy = new Button();
+            viewPrivacy.Text = "查看《隐私政策》";
+            viewPrivacy.SetBounds(370, 254, 166, 26);
+            viewPrivacy.Click += delegate { ShowAgreement("《隐私政策》", Program.PrivacyResource); };
+            Controls.Add(viewPrivacy);
+
+            LinkLabel policyLink = new LinkLabel();
+            policyLink.Text = "阅读完整隐私政策与用户协议后，勾选同意并继续安装。";
+            policyLink.SetBounds(24, 286, 512, 22);
+            policyLink.ForeColor = Color.FromArgb(96, 100, 112);
+            policyLink.LinkClicked += delegate { ShowAgreement("《隐私政策》", Program.PrivacyResource); };
+            Controls.Add(policyLink);
+
+            _agreeEula.Text = "我已阅读并同意《用户协议》";
+            _agreePrivacy.Text = "我已阅读并同意《隐私政策》";
+
+            AcceptButton = null;
             CancelButton = _secondary;
+            _primary.Enabled = false;
+        }
+
+        private void OnBrowse(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "选择 CrMCDownload 安装目录";
+                dlg.ShowNewFolderButton = true;
+                dlg.SelectedPath = Program.TargetDir;
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    try
+                    {
+                        Program.TargetDir = Path.GetFullPath(dlg.SelectedPath);
+                    }
+                    catch (Exception)
+                    {
+                        return;
+                    }
+                    _pathBox.Text = Program.TargetDir;
+                }
+            }
+        }
+
+        private void OnAgreeChanged(object sender, EventArgs e)
+        {
+            _primary.Enabled = _agreeEula.Checked && _agreePrivacy.Checked;
+        }
+
+        private void ShowAgreement(string title, string resource)
+        {
+            string text = Program.LoadText(resource);
+            if (text.Length == 0)
+            {
+                MessageBox.Show("协议文件缺失，请联系发布者。", title,
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            using (AgreementForm form = new AgreementForm(title, text))
+            {
+                form.ShowDialog(this);
+            }
         }
 
         private void OnSecondary(object sender, EventArgs e)
@@ -724,9 +840,20 @@ namespace CrMcSetup
                 Close();
                 return;
             }
+            if (!_uninstall && (!_agreeEula.Checked || !_agreePrivacy.Checked))
+            {
+                MessageBox.Show("请先阅读并同意《用户协议》与《隐私政策》。",
+                    BuildInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
             _primary.Enabled = false;
             _secondary.Enabled = false;
             _desktop.Enabled = false;
+            if (!_uninstall)
+            {
+                _agreeEula.Enabled = false;
+                _agreePrivacy.Enabled = false;
+            }
             int rc = _uninstall
                 ? Program.DoUninstall(Report, true)
                 : Program.DoInstall(Report, _desktop.Checked, false, true);
@@ -758,6 +885,42 @@ namespace CrMcSetup
             _bar.Value = pct;
             if (text != null) _sub.Text = text;
             Application.DoEvents();
+        }
+    }
+
+    internal sealed class AgreementForm : Form
+    {
+        internal AgreementForm(string title, string text)
+        {
+            Text = title + " - CrMCDownload";
+            ClientSize = new Size(620, 460);
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Microsoft YaHei UI", 9F);
+
+            TextBox box = new TextBox();
+            box.Multiline = true;
+            box.ReadOnly = true;
+            box.ScrollBars = ScrollBars.Vertical;
+            box.WordWrap = true;
+            box.Text = text;
+            box.SetBounds(12, 12, 596, 404);
+            box.BackColor = Color.White;
+            box.ForeColor = Color.FromArgb(40, 44, 56);
+            box.SelectionStart = 0;
+            box.SelectionLength = 0;
+            Controls.Add(box);
+
+            Button close = new Button();
+            close.Text = "关闭";
+            close.SetBounds(506, 424, 102, 30);
+            close.Click += delegate { Close(); };
+            Controls.Add(close);
+
+            AcceptButton = close;
+            CancelButton = close;
         }
     }
 }

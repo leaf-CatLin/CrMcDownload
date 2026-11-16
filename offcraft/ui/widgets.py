@@ -20,7 +20,16 @@ from PyQt6.QtWidgets import (
 from offcraft.content.modrinth import ProjectHit
 from offcraft.ui.theme import ACCENT, ACCENT_SOFT, MUTED, TEXT, human_count, initial_pixmap
 
-__all__ = ["Badge", "Card", "ComboPolisher", "ContentRow", "ElidedLabel", "Tile", "polish_combo"]
+__all__ = [
+    "Badge",
+    "Card",
+    "Combo",
+    "ComboPolisher",
+    "ContentRow",
+    "ElidedLabel",
+    "Tile",
+    "polish_combo",
+]
 
 #: 弹层专用样式：只作用在这个弹层窗口及其子控件，不影响其它列表
 _POPUP_QSS = f"""
@@ -43,6 +52,19 @@ QAbstractItemView::item {{
     border-radius: 6px;
 }}
 QAbstractItemView::item:hover {{ background: #F2F6FE; }}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 4px 2px;
+}}
+QScrollBar::handle:vertical {{
+    background: #C7D4E8;
+    border-radius: 3px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{ background: #A9BCD8; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 """
 
 
@@ -65,6 +87,9 @@ def style_combo_popup(popup: QWidget, view: QAbstractItemView | None = None) -> 
     if view is not None:
         view.setFrameShape(QFrame.Shape.NoFrame)
         view.setContentsMargins(0, 0, 0, 0)
+        # 按像素滚动比按条目跳更顺滑；横向不需要滚动条
+        view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         palette = view.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
         palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT_SOFT))
@@ -75,6 +100,24 @@ def style_combo_popup(popup: QWidget, view: QAbstractItemView | None = None) -> 
 def polish_combo(combo: QComboBox) -> None:
     """保留给外部调用的兼容入口（当前统一由 ComboPolisher 在弹层显示时处理）。"""
     return None
+
+
+class Combo(QComboBox):
+    """通用下拉框：限制弹层高度，未获得焦点时忽略滚轮。
+
+    版本下拉框在启动页顶部，鼠标滚轮滑过时如果直接响应，很容易在滚动页面时
+    误切换版本；只有用户点过下拉框（获得焦点）后才允许滚轮切换。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMaxVisibleItems(12)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
 
 
 class ComboPolisher(QObject):

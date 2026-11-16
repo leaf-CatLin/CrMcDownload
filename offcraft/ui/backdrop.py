@@ -11,14 +11,12 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QPoint, QRectF, QSize, Qt
+from PyQt6.QtCore import QPoint, QSize, Qt
 from PyQt6.QtGui import (
     QColor,
     QLinearGradient,
     QMovie,
     QPainter,
-    QPainterPath,
-    QPen,
     QPixmap,
 )
 from PyQt6.QtWidgets import QWidget
@@ -55,10 +53,6 @@ class Backdrop(QWidget):
         self._pixmap: QPixmap | None = None
         self._scaled: QPixmap | None = None
         self._scaled_key: tuple[int, int, int, int] | None = None
-        #: PCL 风格的外壳：内容收进一层圆角卡片，四周留出阴影（FormMain.xaml Margin 10 + 8）
-        self._shell = False
-        self._inset = 18
-        self._radius = 6
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
 
     # ---------------------------------------------------------------- 设置
@@ -74,15 +68,6 @@ class Backdrop(QWidget):
     def shutdown(self) -> None:
         """窗口退出前停止 GIF，避免 QMovie 在对象销毁后仍触发回调。"""
         self._stop_movie()
-
-    def set_shell(self, enabled: bool, inset: int = 18, radius: int = 6) -> None:
-        """PCL 风格外壳：内容收进 ``inset`` 内边距的圆角卡片，并在外侧画柔和阴影。"""
-        if (enabled, inset, radius) == (self._shell, self._inset, self._radius):
-            return
-        self._shell = bool(enabled)
-        self._inset = int(inset)
-        self._radius = int(radius)
-        self.update()
 
     def _load_image(self, path: str) -> None:
         self._stop_movie()
@@ -136,40 +121,10 @@ class Backdrop(QWidget):
         self._scaled_key = key
         return scaled
 
-    def _paint_shadow(self, painter: QPainter, rect) -> None:
-        """在圆角卡片外侧叠出柔和阴影（PCL 的 PanBack 阴影区）。"""
-        painter.save()
-        painter.setPen(Qt.PenStyle.NoPen)
-        for step in range(self._inset, 1, -1):
-            painter.setBrush(QColor(0, 0, 0, 3))
-            painter.drawRoundedRect(
-                QRectF(rect).adjusted(-step, -step + 2, step, step + 2),
-                self._radius + step,
-                self._radius + step,
-            )
-        painter.setBrush(QColor(0, 0, 0, 18))
-        painter.drawRoundedRect(
-            QRectF(rect).adjusted(-1, 1, 1, 3),
-            self._radius + 1,
-            self._radius + 1,
-        )
-        painter.restore()
-
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        if self._shell:
-            # PCL 风格：内容收进圆角卡片，外圈留给阴影
-            rect = self.rect().adjusted(
-                self._inset, self._inset, -self._inset, -self._inset
-            )
-            self._paint_shadow(painter, rect)
-            clip = QPainterPath()
-            clip.addRoundedRect(QRectF(rect), self._radius, self._radius)
-            painter.setClipPath(clip)
-        else:
-            rect = self.rect()
+        rect = self.rect()
 
         # 1) 默认渐变做兜底（图片 PNG/GIF 带透明通道时不会露出黑色底）
         gradient = QLinearGradient(
@@ -199,17 +154,5 @@ class Backdrop(QWidget):
         elif self._color.isValid():
             # 只有颜色：纯色铺满（渐变仍在最底层，仅作为透明兜底）
             painter.fillRect(rect, self._color)
-
-        # 4) 圆角卡片描边，让边缘在浅色背景上也能看出边界
-        if self._shell:
-            pen = QPen(QColor(0, 0, 0, 26))
-            pen.setWidth(1)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(
-                QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5),
-                self._radius,
-                self._radius,
-            )
 
         painter.end()

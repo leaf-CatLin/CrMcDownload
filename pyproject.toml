@@ -9,6 +9,10 @@ license = { text = "MIT" }
 # 正版登录的内嵌 WebView2 登录窗口依赖 pywebview（Windows 下经 pythonnet 调用系统 WebView2 运行时）。
 dependencies = ["pillow>=10", "pynacl>=1.5", "pywebview>=5"]
 
+[dependency-groups]
+# 测试所需：pytest（test_updater / test_microsoft_auth 用到）与 PyQt6（GUI 相关测试）
+dev = ["pytest>=8", "PyQt6>=6.6"]
+
 [tool.uv]
 # 纯应用工程：不构建 wheel；GUI 走系统已有 PyQt6，仅显式声明 Pillow
 package = false
