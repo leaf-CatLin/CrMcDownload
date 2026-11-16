@@ -156,6 +156,24 @@
   由镜像服务在 `/page` 直出，含概览 / 缓存 / 下载热度 / 联机 / 皮肤五个页面；`dist` 缺失时 `/page` 返回 404，
   不影响其它路由。
 
+### 安全与稳定修复（0.8.5-r1）
+
+- **镜像服务端**：
+  - 令牌鉴权改用恒定时间比较（`hmac.compare_digest`），杜绝基于比较耗时的令牌探测；
+  - 上游 `Content-Type` / `ETag` / `Last-Modified` 转发前清洗 CR/LF，堵住响应头注入；
+  - 响应头已发出后的上游异常不再二次写 502，改为干净断开，避免「头嵌 body」的损坏响应；
+  - `host` / `port` 支持 IPv6 监听（`[::1]:8081`），裸 IPv6 地址不再被截坏。
+- **客户端**：
+  - 每日一言三级兜底全部纳入异常处理，网络全挂不再抛错，也不把内置文案写进当天缓存；
+  - natives 分类器按平台 + 架构选择（Windows/OS X arm64 优先取 `*-arm64` 键），
+    `detect_os` 正确识别 aarch64，规则匹配支持 `os.arch=arm64`；
+  - 加载器安装器下载后校验 SHA-1（提供时）与 ZIP 完整性（含 `version.json`），损坏自动删除重下；
+  - 联机页刷新状态只在 UI 线程复位，消除后台/UI 双写竞态；
+  - 服务器收藏 `port` 字段容忍历史非数字值，不再抛 `ValueError`。
+- **安装器**：新增《用户协议》与《隐私政策》展示，勾选同意才能继续；支持「更改…」自定义安装路径。
+- **工程**：`user/pyproject.toml` 新增 dev 依赖组（pytest + PyQt6），与 `server` 的 dev 组对齐；
+  服务端新增安全路径测试（令牌 / 响应头清洗 / 上游错误）。
+
 ```bash
 cd user
 python main.py                     # 需要 PyQt6
@@ -168,7 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build_installer.ps
 #         启动的进程写不了 C 盘，安装器会直接弹框说明而不是静默失败
 ```
 
-当前版本：`0.6.0`（`user`、`user-*` 分支）。
+当前版本：`0.8.5`（`user`、`user-*` 分支）；服务端 `0.7.0`。
 
 配置默认在 `%APPDATA%\CrMCDownload\config.json`。
 

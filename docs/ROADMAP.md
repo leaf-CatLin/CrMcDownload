@@ -33,8 +33,8 @@
 
 | 仓库 | 命令 | 数量 |
 | --- | --- | --- |
-| `user` | `python -m unittest discover -s tests` | 228 |
-| `server` | `python -m pytest tests -q`（或 `unittest discover`） | 90 |
-| `user-downloader` / `user-launcher` / `user-ui` | 同上 | 快照落后于 `user`，未随 0.5.4 同步 |
+| `user` | `python -m unittest discover -s tests` | ~420（`test_updater` / `test_microsoft_auth` / `test_theme` 需装 dev 依赖 pytest 与 PyQt6） |
+| `server` | `python -m pytest tests -q`（或 `unittest discover`） | 206 |
+| `user-downloader` / `user-launcher` / `user-ui` | 同上 | 快照落后于 `user`，未随 0.8.x 同步 |
 
 另有离屏界面自检 `devtools/ui_smoke.py`（断言式）与截图 `devtools/ui_shots.py`。
