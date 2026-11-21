@@ -2,6 +2,15 @@
 
 Minecraft 文件镜像服务：为客户端代理 Mojang / Fabric / Modrinth 元数据与文件，带磁盘缓存、路径白名单与访问令牌。
 
+## 当前版本
+
+服务端 `0.7.0`，对外通告的客户端最新版本为 **`0.9.1`**（`MIRROR_UPDATE_LATEST_VERSION`，
+`/update` 与 `/api/update` 都读它）。线上 `.env` 建议同时设 `MIRROR_UPDATE_MIN_VERSION=0.8.5`，
+让 0.8.5 之前的客户端收到 426 强制更新。
+
+发布新客户端时这里要改三处：`server_mirror/config.py` 的 `update_latest` 默认值、
+`.env.example` 的 `MIRROR_UPDATE_LATEST_VERSION`、以及本段说明。
+
 ## 分支模型
 
 | 分支 | 内容 |
@@ -94,9 +103,9 @@ GitHub 资产 302 到 `objects.githubusercontent.com` 时由服务端跟随（�
 | `MIRROR_PAGE_DIR` | `./page/dist` | 官网 + 看板构建产物目录 |
 | `MIRROR_SERVER_PROBE_INTERVAL` | `300` | 后台探测间隔（秒） |
 | `MIRROR_SERVER_PROBE_ENABLE` | `on` | 关闭则不启动探测线程 |
-| `MIRROR_UPDATE_REPO` | `crazying-dev/CrMcDownload` | 发布仓库（`owner/repo`） |
-| `MIRROR_UPDATE_LATEST_VERSION` | `0.7.0` | 最新版本号，`/update` 与 `/api/update` 都读它 |
-| `MIRROR_UPDATE_MIN_VERSION` | 空 | 最低可用版本；空 = 不做版本门槛 |
+| `MIRROR_UPDATE_REPO` | `leaf-CatLin/CrMcDownload` | 发布仓库（`owner/repo`） |
+| `MIRROR_UPDATE_LATEST_VERSION` | `0.9.1` | 最新版本号，`/update` 与 `/api/update` 都读它 |
+| `MIRROR_UPDATE_MIN_VERSION` | 空 | 最低可用版本；空 = 不做版本门槛（线上 `.env` 建议设为 `0.8.5`） |
 | `MIRROR_UPDATE_ENFORCE` | `on` | 关掉后即使低于最低版本也只提示不拒绝 |
 | `MIRROR_UPDATE_RELEASE_URL` | 空 | 自定义发布页地址；空 = `https://github.com/<repo>/releases/tag/v<latest>` |
 | `MIRROR_UPDATE_ASSET` | 空 | 安装包文件名，可用 `{version}` 占位；空 = `CrMCDownload-<latest>-win64-setup.exe` |
