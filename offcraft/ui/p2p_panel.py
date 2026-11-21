@@ -199,7 +199,7 @@ class P2PPanel(QWidget):
             "房主点「重置密码」会清出所有成员，只有拿到新密码的人能回来。密码加密保存在本机（换机不可解）。"
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        hint.setObjectName("muted")
         root.addWidget(hint)
 
         form_card = Card(self, margins=(14, 12, 14, 12))
@@ -256,28 +256,28 @@ class P2PPanel(QWidget):
 
         self.status_label = QLabel("未连接。")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet(f"color: {MUTED};")
+        self.status_label.setObjectName("muted")
         root.addWidget(self.status_label)
 
         self.vpn_label = QLabel("")
         self.vpn_label.setWordWrap(True)
-        self.vpn_label.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.vpn_label.setObjectName("muted")
         self.vpn_label.setVisible(False)
         root.addWidget(self.vpn_label)
 
         self.current_room_label = QLabel("当前房间：未连接。")
         self.current_room_label.setWordWrap(True)
-        self.current_room_label.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.current_room_label.setObjectName("muted")
         root.addWidget(self.current_room_label)
 
         self.rooms_label = QLabel("本设备已登记房间：读取中…")
         self.rooms_label.setWordWrap(True)
-        self.rooms_label.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.rooms_label.setObjectName("muted")
         root.addWidget(self.rooms_label)
 
         saved_row = QHBoxLayout()
         saved_title = QLabel("已进入的房间（双击可快速加入）")
-        saved_title.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        saved_title.setObjectName("muted")
         saved_row.addWidget(saved_title)
         saved_row.addStretch(1)
         self.reveal_button = QPushButton("查看密码")
@@ -298,7 +298,7 @@ class P2PPanel(QWidget):
 
         peers_row = QHBoxLayout()
         peers_title = QLabel("在线成员")
-        peers_title.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        peers_title.setObjectName("muted")
         peers_row.addWidget(peers_title)
         peers_row.addStretch(1)
         self.kick_button = QPushButton("踢出所选")

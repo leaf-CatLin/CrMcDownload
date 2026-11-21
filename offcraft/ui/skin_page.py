@@ -1,46 +1,46 @@
-"""皮肤页：选图 → 预览（2D 展开）→ 上传到镜像 /skin → 状态反馈。
+"""皮肤页：选图 → 本地保存 → 生成资源包（PCL 做法，完全离线）。
 
-入口挂在启动页账号行「自定义皮肤」与设置页卡片上（由 MainWindow 包成对话框）。
-未配置下载源时禁用上传并给出说明；上传成功后本地缓存并刷新启动页头像。
+与旧实现的区别（按用户要求）：**移除一切上传 / 镜像皮肤库 / 删除远端**逻辑。
+皮肤只存本机，通过生成本地资源包生效——这正是 PCL 的思路：
+
+1. 皮肤 PNG 保存到 ``<数据目录>/skins/<账户名>.png``（头像、下次启动都用它）；
+2. 每次启动前把它写成 ``<游戏目录>/resourcepacks/CrMCDownloadSkin/``，
+   覆盖原版玩家贴图；不需要 CustomSkinLoader，原版实例也能用；
+3. 好处：不联网、不依赖 mod、不进服务端，换账户/换实例都不会互相干扰。
+
+入口挂在启动页「皮肤」按钮与设置页卡片上（由 MainWindow 包成对话框）。
 """
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from offcraft.skins.avatar import head_avatar
 from offcraft.skins.default import default_skin_bytes
+from offcraft.skins.pack import PACK_DIR_NAME, remove_skin_pack
 from offcraft.skins.upload import (
     SkinError,
-    delete_skin,
-    fetch_skin,
     inspect_skin,
-    list_skins,
-    load_local_skin,
+    load_slot_skin,
     read_skin,
-    remove_local_skin,
-    save_local_skin,
-    upload_skin,
+    remove_slot_skin,
+    save_slot_skin,
 )
-from offcraft.ui.theme import MUTED, initial_pixmap
+from offcraft.ui.theme import MUTED
 from offcraft.ui.widgets import Badge, Card
 
 __all__ = ["LAYOUT_CHOICES", "SkinPage"]
@@ -55,52 +55,57 @@ LAYOUT_CHOICES = (
 PREVIEW_PX = 170
 
 
+def _pixmap_from_bytes(data: bytes) -> QPixmap:
+    pixmap = QPixmap()
+    if data:
+        pixmap.loadFromData(data)
+    return pixmap
+
+
 class _PreviewTile(QWidget):
     """棋盘格底 + 圆角贴图预览（纯 QPainter 绘制，不依赖网页）。"""
 
     def __init__(self, size: int = PREVIEW_PX, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(size, size)
         self._pixmap: QPixmap | None = None
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
     def setPixmap(self, pixmap: QPixmap) -> None:  # noqa: N802 - 与 QLabel 保持一致
-        self._pixmap = pixmap if not pixmap.isNull() else None
+        self._pixmap = pixmap
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
-        path = QPainterPath()
-        path.addRoundedRect(rect, 12.0, 12.0)
-        painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor("#F8FAFD"))
-        cell = 10
-        dark = QColor("#EDF1F7")
-        for row in range(0, self.height(), cell):
-            for col in range(0, self.width(), cell):
+        rect = self.rect()
+        # 棋盘格：透明区域一眼可辨
+        cell = 12
+        painter.fillRect(rect, QColor("#FFFFFF"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#E8EDF4"))
+        for row in range(0, rect.height(), cell):
+            for col in range(0, rect.width(), cell):
                 if (row // cell + col // cell) % 2 == 0:
-                    painter.fillRect(col, row, cell, cell, dark)
-        if self._pixmap is not None:
-            target = self._pixmap.scaled(
-                self.width() - 22,
-                self.height() - 22,
+                    painter.drawRect(col, row, cell, cell)
+        if self._pixmap is not None and not self._pixmap.isNull():
+            path = QPainterPath()
+            path.addRoundedRect(0, 0, rect.width(), rect.height(), 10, 10)
+            painter.setClipPath(path)
+            scaled = self._pixmap.scaled(
+                rect.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
+                Qt.TransformationMode.SmoothTransformation,
             )
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-            painter.drawPixmap(
-                (self.width() - target.width()) // 2,
-                (self.height() - target.height()) // 2,
-                target,
-            )
-        painter.setClipping(False)
-        painter.setPen(QPen(QColor("#E1E8F2"), 1.0))
-        painter.drawPath(path)
+            x = (rect.width() - scaled.width()) // 2
+            y = (rect.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
         painter.end()
 
 
 class SkinPage(QWidget):
+    """本地皮肤编辑页：选图、预览、保存、生成资源包。"""
+
     def __init__(self, window: Any, *, read_only: bool = False) -> None:
         super().__init__()
         self.window = window
@@ -110,17 +115,15 @@ class SkinPage(QWidget):
         self._busy = False
         self._closed = False
         self._build()
-        self._reload_state()
-        self._refresh_library()
+        self._load_saved()
         if read_only:
-            # 上传链路暂时不可靠，入口只保留查看；头像仍是本地缓存的那张
-            self.upload.setVisible(False)
-            self.upload.setEnabled(False)
-            sync = getattr(self, "sync_btn", None)
-            if sync is not None:
-                sync.setVisible(False)
-            self.info.setText("当前仅展示本地已缓存的皮肤；上传功能暂未开放。")
+            # 只读入口（例如从启动页快速查看）：允许看，但不给保存/清除按钮
+            for name in ("save", "choose", "default_btn", "remove"):
+                button = getattr(self, name, None)
+                if button is not None:
+                    button.setVisible(False)
 
+    # ------------------------------------------------------------------ 构建
     def _build(self) -> None:
         style = getattr(self.window.config, "skin_layout", "v1")
         builder = getattr(self, f"_build_{style}", None) or self._build_v1
@@ -135,147 +138,93 @@ class SkinPage(QWidget):
     def _make_preview(self, size: int, height: int, *, top_only: bool = False) -> QFrame:
         stage = QFrame()
         stage.setObjectName("skinStage")
-        radius = (
-            "border-top-left-radius: 14px; border-top-right-radius: 14px;"
-            if top_only
-            else "border-radius: 12px;"
-        )
-        stage.setStyleSheet(
-            f"QFrame#skinStage {{ border: 0px; {radius}"
-            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            " stop:0 rgba(234, 241, 254, 0.62), stop:0.55 rgba(246, 249, 254, 0.50),"
-            " stop:1 rgba(255, 255, 255, 0.46)); }"
-        )
         stage.setFixedHeight(height)
-        stage_layout = QVBoxLayout(stage)
-        stage_layout.setContentsMargins(12, 12, 12, 12)
+        stage.setStyleSheet(
+            "QFrame#skinStage { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+            " stop:0 rgba(234, 241, 255, 0.9), stop:1 rgba(255, 255, 255, 0.9));"
+            " border: 1px solid rgba(227, 233, 242, 0.9); border-radius: 14px; }"
+        )
+        layout = QVBoxLayout(stage)
+        layout.setContentsMargins(0, 12 if top_only else 0, 0, 0)
+        layout.addStretch(1)
+        row = QHBoxLayout()
+        row.addStretch(1)
         self.preview = _PreviewTile(size)
-        self.preview.setPixmap(initial_pixmap(self.window.config.username, 128, "skin"))
-        stage_layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(self.preview)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(1)
         return stage
 
     def _make_model_combo(self, width: int | None = 190) -> QComboBox:
         self.model = QComboBox()
-        self.model.addItems(["自动判定", "经典 (classic)", "纤细 (slim)"])
+        self.model.addItem("自动判定（按图片）", "auto")
+        self.model.addItem("经典（4px 手臂）", "classic")
+        self.model.addItem("纤细（3px 手臂）", "slim")
         if width:
-            self.model.setFixedWidth(width)
+            self.model.setMinimumWidth(width)
         self.model.currentIndexChanged.connect(self._model_changed)
         return self.model
 
     def _make_choose(self, text: str = "＋  选择皮肤图片（PNG）") -> QPushButton:
         self.choose = QPushButton(text)
-        self.choose.setObjectName("skinDrop")
-        self.choose.setFixedHeight(46)
+        self.choose.setObjectName("ghost")
+        self.choose.setMinimumHeight(38)
         self.choose.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.choose.setStyleSheet(
-            "QPushButton#skinDrop { text-align: left; padding: 0px 14px;"
-            " border: 1px dashed #C7D7F3; background: rgba(247, 249, 253, 0.58);"
-            " border-radius: 10px; color: #2D6CDF; font-size: 9.5pt; font-weight: 600; }"
-        )
         self.choose.clicked.connect(self._choose_file)
         return self.choose
 
-    def _make_upload(self) -> QPushButton:
-        self.upload = QPushButton("上传皮肤到镜像")
-        self.upload.setObjectName("primary")
-        self.upload.setMinimumHeight(38)
-        self.upload.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.upload.clicked.connect(self._upload)
-        return self.upload
+    def _make_save(self) -> QPushButton:
+        self.save = QPushButton("保存到本地并应用")
+        self.save.setObjectName("primary")
+        self.save.setMinimumHeight(38)
+        self.save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save.setToolTip(
+            "皮肤只保存在本机，并生成为资源包；下次启动游戏时自动生效（无需联网、无需 mod）"
+        )
+        self.save.clicked.connect(self._save_local)
+        return self.save
 
     def _make_actions(self, *, flat: bool = False) -> QHBoxLayout:
-        actions = QHBoxLayout()
-        actions.setSpacing(8 if not flat else 16)
-        self.default_btn = QPushButton("使用默认")
-        self.default_btn.setMinimumHeight(30)
-        self.default_btn.clicked.connect(self._use_default)
-        self.sync_btn = QPushButton("同步已上传")
-        self.sync_btn.setMinimumHeight(30)
-        self.sync_btn.clicked.connect(self._sync)
-        self.delete_btn = QPushButton("删除")
-        self.delete_btn.setMinimumHeight(30)
-        if flat:
-            flat_style = (
-                "QPushButton { background: transparent; border: 0; color: #2D6CDF;"
-                " padding: 0 2px; font-size: 8.6pt; }"
-                "QPushButton:hover { color: #1F55B8; }"
-            )
-            for button in (self.default_btn, self.sync_btn):
-                button.setStyleSheet(flat_style)
-            self.delete_btn.setStyleSheet(
-                "QPushButton { background: transparent; border: 0; color: #D24B45;"
-                " padding: 0 2px; font-size: 8.6pt; }"
-            )
-        else:
-            self.delete_btn.setStyleSheet(
-                "QPushButton { color: #D24B45; border-color: #F2D8D6;"
-                " background: rgba(255, 249, 249, 0.60); }"
-            )
-        self.delete_btn.clicked.connect(self._delete)
-        for button in (self.default_btn, self.sync_btn, self.delete_btn):
-            actions.addWidget(button)
-        if flat:
-            # 扁平样式按内容宽度排列，靠左成组，避免按钮被拉伸铺满整行
-            actions.addStretch(1)
-            for button in (self.default_btn, self.sync_btn, self.delete_btn):
-                button.setSizePolicy(
-                    QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-                )
-        return actions
+        self.sync_btn = QPushButton("使用默认")
+        self.sync_btn.setObjectName("ghost")
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.setToolTip("恢复内置的 Steve 风格默认皮肤")
+        self.sync_btn.clicked.connect(self._use_default)
+        self.default_btn = self.sync_btn
+
+        self.delete_btn = QPushButton("清除本地皮肤")
+        self.delete_btn.setObjectName("danger")
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.clicked.connect(self._clear)
+        self.remove = self.delete_btn
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.sync_btn)
+        row.addWidget(self.delete_btn)
+        row.addStretch(1)
+        return row
 
     def _make_info(self) -> QLabel:
-        self.info = QLabel(" ")
+        self.info = QLabel("皮肤保存在本机，并会生成为资源包，下次启动自动生效。")
         self.info.setWordWrap(True)
-        self.info.setMinimumHeight(32)
         self.info.setStyleSheet(f"color: {MUTED}; font-size: 8.4pt;")
         return self.info
 
     def _make_meta(self) -> QLabel:
         self.meta_label = QLabel("尚未选择皮肤")
-        self.meta_label.setWordWrap(True)
         self.meta_label.setStyleSheet(f"color: {MUTED}; font-size: 8.4pt;")
         return self.meta_label
 
-    def _make_library_card(self, *, height: int | None = None) -> Card:
-        card = Card(margins=(14, 12, 14, 12))
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        title = QLabel("镜像皮肤库")
-        title.setStyleSheet("font-size: 9.5pt; font-weight: 700;")
-        head.addWidget(title)
-        hint = QLabel("双击预览")
-        hint.setStyleSheet(f"color: {MUTED}; font-size: 8pt;")
-        head.addWidget(hint)
-        head.addStretch(1)
-        self.library_refresh = QPushButton("刷新")
-        self.library_refresh.setFixedHeight(26)
-        self.library_refresh.setStyleSheet(
-            "QPushButton { color: #2D6CDF; background: rgba(232, 240, 254, 0.78);"
-            " border: 0px; border-radius: 13px; padding: 0px 12px; font-size: 8.2pt; }"
-        )
-        self.library_refresh.clicked.connect(self._refresh_library)
-        head.addWidget(self.library_refresh)
-        card.add_layout(head)
+    def _make_model_label(self) -> QLabel:
+        label = QLabel("模型")
+        label.setStyleSheet(f"font-size: 9pt; color: {MUTED}; font-weight: 600;")
+        return label
 
-        self.library = QListWidget()
-        self.library.setStyleSheet(
-            "QListWidget { background: rgba(247, 249, 253, 0.55);"
-            " border: 1px solid rgba(227, 233, 242, 0.80);"
-            " border-radius: 10px; padding: 4px; font-size: 8.6pt; }"
-            "QListWidget::item { padding: 6px 8px; border-radius: 6px; }"
-            "QListWidget::item:selected { background: rgba(232, 240, 254, 0.82); color: #2D6CDF; }"
-        )
-        self.library.setWordWrap(True)
-        self.library.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.library.itemDoubleClicked.connect(self._preview_library_item)
-        if height:
-            self.library.setFixedHeight(height)
-        card.add(self.library, 1)
-        return card
-
-    # ------------------------------------------------------------- 三套布局
+    # ------------------------------------------------------------------ 布局
     def _build_v1(self, root: QVBoxLayout) -> None:
-        """双栏卡片：左侧大预览，右侧操作，底部皮肤库（默认样式）。"""
+        """双栏卡片：左侧大预览，右侧操作（默认样式）。"""
         root.setContentsMargins(22, 18, 22, 16)
         root.setSpacing(12)
 
@@ -295,7 +244,7 @@ class SkinPage(QWidget):
         title = QLabel("自定义皮肤")
         title.setStyleSheet("font-size: 17pt; font-weight: 700;")
         titles.addWidget(title)
-        subtitle = QLabel("上传 64×64 / 64×32 PNG，装了 CustomSkinLoader 的实例会显示")
+        subtitle = QLabel("选一张 64×64 / 64×32 PNG，保存到本机并自动生成资源包")
         subtitle.setStyleSheet(f"color: {MUTED}; font-size: 8.6pt;")
         titles.addWidget(subtitle)
         header.addLayout(titles)
@@ -321,24 +270,21 @@ class SkinPage(QWidget):
         controls = Card(margins=(16, 14, 16, 14))
         model_row = QHBoxLayout()
         model_row.setSpacing(10)
-        model_label = QLabel("模型")
-        model_label.setStyleSheet("font-size: 9pt; color: #5D6B82; font-weight: 600;")
-        model_row.addWidget(model_label)
+        model_row.addWidget(self._make_model_label())
         model_row.addStretch(1)
         model_row.addWidget(self._make_model_combo(190))
         controls.add_layout(model_row)
         controls.add(self._make_choose())
-        controls.add(self._make_upload())
+        controls.add(self._make_save())
         controls.add_layout(self._make_actions())
         controls.add(self._make_info())
         controls.body.addStretch(1)
         body.addWidget(controls, 1)
         root.addLayout(body, 1)
-
-        root.addWidget(self._make_library_card(height=128), 0)
+        root.addStretch(1)
 
     def _build_v2(self, root: QVBoxLayout) -> None:
-        """工作台：左侧信息栏 + 右侧模型/上传/皮肤库卡片。"""
+        """工作台：左侧信息栏 + 右侧模型/选图卡片。"""
         root.setContentsMargins(22, 18, 22, 16)
         root.setSpacing(12)
 
@@ -349,7 +295,7 @@ class SkinPage(QWidget):
         title = QLabel("皮肤工坊")
         title.setStyleSheet("font-size: 17pt; font-weight: 700;")
         titles.addWidget(title)
-        subtitle = QLabel("选图 → 校验 → 预览 → 上传，全部在本地完成")
+        subtitle = QLabel("选图 → 校验 → 预览 → 保存，全部在本地完成")
         subtitle.setStyleSheet(f"color: {MUTED}; font-size: 8.6pt;")
         titles.addWidget(subtitle)
         header.addLayout(titles)
@@ -383,7 +329,7 @@ class SkinPage(QWidget):
         account = QLabel(self.window.config.username)
         account.setStyleSheet("font-size: 11.5pt; font-weight: 700;")
         name_row.addWidget(account)
-        tag = QLabel("离线账户")
+        tag = QLabel("本地皮肤")
         tag.setStyleSheet(f"color: {MUTED}; font-size: 8.2pt;")
         name_row.addWidget(tag)
         name_row.addStretch(1)
@@ -394,7 +340,7 @@ class SkinPage(QWidget):
         divider.setFixedHeight(1)
         divider.setStyleSheet("background: rgba(227, 233, 242, 0.80);")
         rail_body_layout.addWidget(divider)
-        rail_hint = QLabel("只接受 64×64 / 64×32 PNG；上传后，装了 CustomSkinLoader 的实例会显示。")
+        rail_hint = QLabel("只接受 64×64 / 64×32 PNG；保存后会生成本地资源包，启动时自动生效。")
         rail_hint.setWordWrap(True)
         rail_hint.setStyleSheet(f"color: {MUTED}; font-size: 8.2pt;")
         rail_body_layout.addWidget(rail_hint)
@@ -408,9 +354,7 @@ class SkinPage(QWidget):
         model_card = Card(margins=(14, 12, 14, 12))
         model_row = QHBoxLayout()
         model_row.setSpacing(10)
-        model_label = QLabel("模型")
-        model_label.setStyleSheet("font-size: 9pt; color: #5D6B82; font-weight: 600;")
-        model_row.addWidget(model_label)
+        model_row.addWidget(self._make_model_label())
         model_row.addStretch(1)
         model_row.addWidget(self._make_model_combo(190))
         model_card.add_layout(model_row)
@@ -418,23 +362,22 @@ class SkinPage(QWidget):
 
         file_card = Card(margins=(14, 12, 14, 12))
         file_card.add(self._make_choose())
-        file_card.add(self._make_upload())
+        file_card.add(self._make_save())
         file_card.add_layout(self._make_actions())
         file_card.add(self._make_info())
         work.addWidget(file_card, 0)
-
-        work.addWidget(self._make_library_card(), 1)
+        work.addStretch(1)
         main.addLayout(work, 1)
         root.addLayout(main, 1)
 
     def _build_v3(self, root: QVBoxLayout) -> None:
-        """极简单栏：居中标题 + 横向 Hero 卡 + 皮肤库。"""
+        """极简单栏：居中标题 + 横向 Hero 卡。"""
         root.setContentsMargins(26, 18, 24, 16)
         root.setSpacing(12)
 
         head = QVBoxLayout()
         head.setSpacing(4)
-        kicker = QLabel("SKIN STUDIO")
+        kicker = QLabel("SKIN")
         kicker.setAlignment(Qt.AlignmentFlag.AlignCenter)
         kicker.setStyleSheet(f"color: {MUTED}; font-size: 8pt;")
         head.addWidget(kicker)
@@ -462,7 +405,7 @@ class SkinPage(QWidget):
         account = QLabel(self.window.config.username)
         account.setStyleSheet("font-size: 16pt; font-weight: 700;")
         name_row.addWidget(account)
-        tag = QLabel("离线账户")
+        tag = QLabel("本地皮肤")
         tag.setStyleSheet(f"color: {MUTED}; font-size: 8.4pt;")
         name_row.addWidget(tag)
         name_row.addStretch(1)
@@ -476,9 +419,7 @@ class SkinPage(QWidget):
 
         model_row = QHBoxLayout()
         model_row.setSpacing(10)
-        model_label = QLabel("模型")
-        model_label.setStyleSheet("font-size: 9pt; color: #5D6B82; font-weight: 600;")
-        model_row.addWidget(model_label)
+        model_row.addWidget(self._make_model_label())
         model_row.addWidget(self._make_model_combo(180))
         model_row.addStretch(1)
         info_col.addLayout(model_row)
@@ -486,7 +427,7 @@ class SkinPage(QWidget):
         cta = QHBoxLayout()
         cta.setSpacing(9)
         cta.addWidget(self._make_choose("＋  选择 PNG…"), 1)
-        cta.addWidget(self._make_upload(), 0)
+        cta.addWidget(self._make_save(), 0)
         info_col.addLayout(cta)
         info_col.addLayout(self._make_actions(flat=True))
         info_col.addWidget(self._make_info())
@@ -494,37 +435,53 @@ class SkinPage(QWidget):
         row.addLayout(info_col, 1)
         hero.add_layout(row)
         root.addWidget(hero, 0)
-        root.addWidget(self._make_library_card(), 1)
-
-    def _label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("muted")
-        return label
+        root.addStretch(1)
 
     # ------------------------------------------------------------------ 状态
-    def shutdown(self) -> None:
-        """对话框关闭时置位；后台线程回来的回调不再触碰已销毁的控件。"""
-        self._closed = True
+    def _load_saved(self) -> None:
+        """打开页面时读回本地已保存的皮肤。"""
+        try:
+            slot = load_slot_skin()
+        except SkinError:
+            slot = None
+        if slot is None:
+            self.preview.setPixmap(_pixmap_from_bytes(default_skin_bytes()))
+            self.meta_label.setText("尚未选择皮肤（显示默认皮肤）")
+            self.status_badge.set("默认皮肤", "gray")
+            self._reload_state()
+            return
+        data, _slot_model = slot
+        try:
+            info = inspect_skin(data, self.window.config.username, model="auto")
+        except SkinError:
+            info = None
+        self._apply_data(data, info, note="已载入本机保存的皮肤。")
+        self.status_badge.set("已保存", "green")
 
-    def _is_closed(self) -> bool:
-        return self._closed
-
-    def _base(self) -> str:
-        return getattr(self.window.config, "download_base", "") or ""
+    def _apply_data(self, data: bytes, info: Any, *, note: str = "") -> None:
+        self._data = data
+        self._info = info
+        pixmap = _pixmap_from_bytes(data)
+        if not pixmap.isNull():
+            self.preview.setPixmap(pixmap)
+        if info is not None:
+            self.meta_label.setText(
+                f"{getattr(info, 'width', '?')}×{getattr(info, 'height', '?')} · "
+                f"{getattr(info, 'model', '?')} · {len(data)} B"
+            )
+        self.status_badge.set("待保存", "amber")
+        if note:
+            self.info.setText(note)
+        self._reload_state()
 
     def _reload_state(self) -> None:
-        enabled = bool(self._base())
-        online = enabled and not self._busy
-        self.upload.setEnabled(enabled and self._data is not None and not self._busy)
-        self.choose.setEnabled(not self._busy)
-        self.default_btn.setEnabled(not self._busy)
-        self.sync_btn.setEnabled(online)
-        self.delete_btn.setEnabled(online)
-        self.library_refresh.setEnabled(online)
-        if not enabled:
-            self.info.setText("尚未配置下载源，无法上传皮肤（按 F12 打开下载源设置）。")
-        elif self._data is None:
-            self.info.setText("请先选择一张皮肤图片，或点「使用默认」。")
+        has_data = self._data is not None
+        for name in ("save", "choose", "default_btn", "delete_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not self._busy)
+        if getattr(self, "save", None) is not None:
+            self.save.setEnabled(has_data and not self._busy)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -545,11 +502,9 @@ class SkinPage(QWidget):
             self.status_badge.set("无效", "red")
             self.info.setText(str(exc))
             self._data = None
-            self.upload.setEnabled(False)
+            self._reload_state()
             return
-        self._apply_data(data, info)
-        base = getattr(self.window.config, "download_base", "") or ""
-        self.upload.setEnabled(bool(base) and not self._busy)
+        self._apply_data(data, info, note="图片已通过校验，点「保存到本地并应用」生效。")
 
     def _model_value(self) -> str:
         return ["auto", "classic", "slim"][self.model.currentIndex()]
@@ -563,258 +518,82 @@ class SkinPage(QWidget):
             )
         except SkinError:
             return
-        self._info = info
-        self._apply_info(info)
-
-    def _apply_info(self, info: Any) -> None:
-        self.status_badge.set(
-            "默认皮肤" if info.name == "default" else f"{info.model}", "blue"
-        )
-        self.meta_label.setText(f"{info.width}×{info.height} · {info.model} · {info.size} 字节")
-        self.info.setText(
-            f"{info.width}×{info.height} · {info.model} · {info.size} 字节 · "
-            f"SHA1 {info.sha1[:12]}"
-        )
-
-    def _apply_data(self, data: bytes, info: Any, *, note: str = "") -> None:
-        self._data = data
-        self._info = info
-        self._render_preview(data)
-        self._apply_info(info)
-        self.upload.setEnabled(bool(self._base()) and not self._busy)
-        if note:
-            self.info.setText(note + "\n" + self.info.text())
+        self._apply_data(self._data, info)
 
     def _use_default(self) -> None:
-        # 内置贴图是经典布局，默认按 classic 标注/上传；用户显式选 slim 时才标 slim。
-        model = "slim" if self._model_value() == "slim" else "classic"
-        data = default_skin_bytes(model)
+        data = default_skin_bytes()
         try:
-            info = inspect_skin(data, self.window.config.username, model=model)
-        except SkinError as exc:
-            self.info.setText(str(exc))
-            return
-        self._apply_data(data, info, note="已加载内置默认皮肤（可直接上传）。")
-        self.status_badge.set("默认皮肤", "blue")
+            info = inspect_skin(data, self.window.config.username, model="classic")
+        except SkinError:
+            info = None
+        self._apply_data(data, info, note="已载入内置默认皮肤，保存后生效。")
 
-    def _sync(self) -> None:
-        if self._busy or not self._base():
+    def _save_local(self) -> None:
+        """保存到本机 + 刷新头像 + 提示会在下次启动生成资源包。"""
+        if self._data is None or self._info is None:
             return
-        self._set_busy(True)
-        self.status_badge.set("同步中…", "amber")
-        name = self.window.config.username
-        model = self._model_value()
-
-        def work() -> None:
-            try:
-                downloader = self.window.make_downloader(progress=False)
-                mirror = self.window.source(downloader)
-                data = fetch_skin(
-                    name, downloader=downloader, mirror=mirror, model=model, fallback=False
-                )
-                if not data:
-                    raise SkinError("镜像上没有该账户的皮肤")
-                info = inspect_skin(data, name, model=model)
-                save_local_skin(info, data)
-                avatar = head_avatar(data, size=128)
-                self.window.post(lambda: self._sync_done(data, info, avatar, None))
-            except Exception as exc:  # noqa: BLE001 - 统一转成界面提示
-                self.window.post(lambda e=str(exc): self._sync_done(None, None, None, e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _sync_done(self, data, info, avatar, error) -> None:
-        if self._closed:
+        model = getattr(self._info, "model", "classic") or "classic"
+        try:
+            path = save_slot_skin(self._data, model=model)
+        except OSError as exc:
+            self.status_badge.set("保存失败", "red")
+            self.info.setText(f"保存失败：{exc}")
             return
-        self._set_busy(False)
-        if error:
-            self.status_badge.set("同步失败", "red")
-            self.info.setText(error)
-            return
-        self._apply_data(data, info, note=f"已从镜像同步 {info.model} 皮肤。")
-        self.status_badge.set("已同步", "green")
+        avatar = head_avatar(self._data, size=128)
         if avatar:
             self.window.apply_avatar(avatar)
+        self.status_badge.set("已保存", "green")
+        self.info.setText(
+            f"已保存到本机：{path}\n"
+            f"启动游戏时会自动生成资源包（resourcepacks/{PACK_DIR_NAME}），"
+            "无需联网、无需安装 mod。"
+        )
 
-    def _delete(self) -> None:
-        if self._busy or not self._base():
-            return
+    def _clear(self) -> None:
         answer = QMessageBox.question(
             self,
-            "删除皮肤",
-            f"确定删除镜像上的 {self.window.config.username} 皮肤吗？",
+            "清除本地皮肤",
+            "确定清除本机保存的皮肤吗？（游戏内会恢复默认皮肤）",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self._set_busy(True)
-        self.status_badge.set("删除中…", "amber")
-        name = self.window.config.username
-
-        def work() -> None:
-            try:
-                downloader = self.window.make_downloader(progress=False)
-                mirror = self.window.source(downloader)
-                removed = delete_skin(name, downloader=downloader, mirror=mirror)
-                remove_local_skin(name)
-                self.window.post(lambda: self._delete_done(removed, None))
-            except Exception as exc:  # noqa: BLE001
-                self.window.post(lambda e=str(exc): self._delete_done(None, e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _delete_done(self, removed, error) -> None:
-        if self._closed:
-            return
-        self._set_busy(False)
-        if error:
-            self.status_badge.set("删除失败", "red")
-            self.info.setText(error)
-            return
+        remove_slot_skin()
+        # 顺手把已生成的资源包也删掉，否则游戏里还会是旧皮肤
+        try:
+            remove_skin_pack(self._game_dir())
+        except OSError:
+            pass
         self._data = None
         self._info = None
-        self.preview.setPixmap(initial_pixmap(self.window.config.username, 128, "skin"))
+        self.preview.setPixmap(_pixmap_from_bytes(default_skin_bytes()))
         self.meta_label.setText("尚未选择皮肤")
-        self.status_badge.set("已删除", "gray")
-        self.info.setText(
-            "已删除镜像皮肤" + (f"（{len(removed)} 个文件）" if removed else "（镜像上本来就没有）")
-        )
+        self.status_badge.set("已清除", "gray")
+        self.info.setText("已清除本地皮肤，游戏内将恢复默认皮肤。")
         self.window.apply_avatar(head_avatar(default_skin_bytes(), size=128))
-        self._refresh_library()
-
-    # ------------------------------------------------------------------ 皮肤库
-    def _refresh_library(self) -> None:
-        if not self._base():
-            self.library.clear()
-            item = QListWidgetItem("未配置下载源，皮肤库不可用")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.library.addItem(item)
-            return
-        self.library_refresh.setEnabled(False)
-        self.library.clear()
-        self.library.addItem("正在读取…")
-
-        def work() -> None:
-            try:
-                downloader = self.window.make_downloader(progress=False)
-                mirror = self.window.source(downloader)
-                items = list_skins(downloader=downloader, mirror=mirror, limit=60)
-                self.window.post(lambda: self._show_library(items, None))
-            except Exception as exc:  # noqa: BLE001
-                self.window.post(lambda e=str(exc): self._show_library([], e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _show_library(self, items: list[dict[str, Any]], error: str | None) -> None:
-        if self._closed:
-            return
-        self.library.clear()
-        if not self._busy:
-            self.library_refresh.setEnabled(True)
-        if error:
-            item = QListWidgetItem(f"读取失败：{error}")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.library.addItem(item)
-            return
-        if not items:
-            item = QListWidgetItem("镜像皮肤库还是空的，上传第一张吧")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.library.addItem(item)
-            return
-        for entry in items:
-            name = str(entry.get("name") or "")
-            model = str(entry.get("model") or "classic")
-            label = f"{name}  ·  {model}"
-            if name == self.window.config.username:
-                label += "  ·  我的"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, {"name": name, "model": model})
-            self.library.addItem(item)
-
-    def _preview_library_item(self, item: QListWidgetItem) -> None:
-        payload = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(payload, dict) or self._busy:
-            return
-        name = str(payload.get("name") or "")
-        model = str(payload.get("model") or "classic")
-        self.status_badge.set("读取中…", "amber")
-
-        def work() -> None:
-            try:
-                downloader = self.window.make_downloader(progress=False)
-                mirror = self.window.source(downloader)
-                data = fetch_skin(
-                    name, downloader=downloader, mirror=mirror, model=model, fallback=False
-                )
-                if not data:
-                    raise SkinError("这张皮肤已被删除")
-                info = inspect_skin(data, self.window.config.username, model=model)
-                self.window.post(lambda: self._library_preview_done(data, info, name, None))
-            except Exception as exc:  # noqa: BLE001
-                self.window.post(lambda e=str(exc): self._library_preview_done(None, None, name, e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _library_preview_done(self, data, info, name, error) -> None:
-        if self._closed:
-            return
-        if error:
-            self.status_badge.set("读取失败", "red")
-            self.info.setText(error)
-            return
-        self._apply_data(data, info, note=f"预览皮肤库中的 {name}（上传会存到当前账户）。")
-        self.status_badge.set("库预览", "blue")
-
-    def _render_preview(self, data: bytes) -> None:
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(data):
-            return
-        scaled = pixmap.scaled(
-            PREVIEW_PX - 30,
-            PREVIEW_PX - 30,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        self.preview.setPixmap(scaled)
-
-    def _upload(self) -> None:
-        if self._data is None:
-            return
-        self.upload.setEnabled(False)
-        self.status_badge.set("上传中…", "amber")
-        self.window.run_task(
-            "上传皮肤",
-            self._upload_worker,
-            on_done=self._upload_finished,
-        )
-
-    def _upload_worker(self, cancel: Any) -> str:
-        data, info = self._data, self._info
-        downloader = self.window.make_downloader(progress=False)
-        mirror = self.window.source(downloader)
-        result = upload_skin(data, info, downloader=downloader, mirror=mirror)
-        save_local_skin(info, data)
-        avatar = head_avatar(data, size=128)
-        self.window.post(lambda a=avatar: self.window.apply_avatar(a))
-        return f"已上传 {info.name}（{info.model}）· {result.get('status', 'ok')}"
-
-    def _upload_finished(self) -> None:
-        if self._closed:
-            return
-        self.status_badge.set("已上传", "green")
         self._reload_state()
-        self._refresh_library()
+
+    def _game_dir(self):
+        getter = getattr(self.window, "game_dir", None)
+        if callable(getter):
+            return getter()
+        return ""
+
+    # ------------------------------------------------------------------ 生命周期
+    def shutdown(self) -> None:
+        self._closed = True
 
     # ------------------------------------------------------------------ 头像
     @staticmethod
     def current_avatar(name: str, size: int = 128) -> bytes | None:
         """取本地缓存皮肤的头像字节（启动页头像用）；无皮肤返回 ``None``。"""
         try:
-            data = load_local_skin(name, model="classic") or load_local_skin(name, model="slim")
+            slot = load_slot_skin()
         except SkinError:
             return None
-        if not data:
+        if slot is None:
             return None
+        data, _model = slot
         avatar = head_avatar(data, size=size)
         return avatar or None

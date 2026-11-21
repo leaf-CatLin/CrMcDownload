@@ -3,6 +3,9 @@
 版本隔离时游戏目录是 ``versions/<id>``，玩家手工放进 ``.minecraft/mods``
 的文件不会被加载；反过来关掉隔离时放进 ``versions/<id>/mods`` 也一样。
 这里把两边都扫一遍，指出「不在加载目录」的条目，便于在启动页禁用 / 移动。
+
+另外提供 :func:`has_shader_loader`：光影（shaderpack）只有装了 Iris 或
+OptiFine 这类前置才会生效，没装时启动页不该给玩家一个点了没反应的「光影」页签。
 """
 
 from __future__ import annotations
@@ -19,6 +22,10 @@ __all__ = [
     "ResourceAudit",
     "ResourceEntry",
     "audit_resources",
+    "PACK_ICON_NAME",
+    "has_shader_loader",
+    "pack_icon_bytes",
+    "shader_loader_name",
 ]
 
 #: 目录名 -> 中文名（顺序即启动页分类顺序）
@@ -32,6 +39,74 @@ KINDS = tuple(KIND_NAMES)
 FILE_SUFFIXES = (".jar", ".zip")
 #: 关掉隔离时最多扫这么多个版本目录，避免全盘遍历拖慢启动
 MAX_VERSION_DIRS = 40
+
+#: 光影前置（按文件名前缀识别，都是 jar 里带 shaderpack 加载能力的老牌 mod）
+#: - Iris：Fabric 上的光影前置，文件名 ``iris-*.jar``
+#: - OptiFine：``OptiFine_*.jar`` / ``optifine*.jar``
+#: - Oculus：Forge 版 Iris 移植，``oculus-*.jar``
+_SHADER_LOADERS = (
+    ("Iris", ("iris-", "iris_")),
+    ("OptiFine", ("optifine",)),
+    ("Oculus", ("oculus",)),
+)
+
+
+def shader_loader_name(mods_dir: Path | str) -> str:
+    """返回已安装的光影前置名（Iris / OptiFine / Oculus）；没有则空串。"""
+    try:
+        items = list(Path(mods_dir).iterdir())
+    except OSError:
+        return ""
+    names = []
+    for item in items:
+        name = item.name.lower()
+        if name.endswith(".disabled"):
+            # 被禁用的前置不算生效
+            continue
+        if not name.endswith(".jar"):
+            continue
+        names.append(name)
+    for label, prefixes in _SHADER_LOADERS:
+        if any(name.startswith(prefix) for name in names for prefix in prefixes):
+            return label
+    return ""
+
+
+def has_shader_loader(mods_dir: Path | str) -> bool:
+    """``mods`` 目录里是否有能加载光影的前置。"""
+    return bool(shader_loader_name(mods_dir))
+
+
+#: 资源包内声明图标的文件名（Minecraft 用它显示在资源包列表里）
+PACK_ICON_NAME = "pack.png"
+
+
+def pack_icon_bytes(path: Path | str) -> bytes | None:
+    """读取资源包/光影包自带的 ``pack.png``，没有就返回 ``None``。
+
+    资源包作者几乎都会在根目录放 ``pack.png``（游戏内资源包列表就显示它），
+    用它当列表图标比按文件名生成的占位图直观得多。
+    文件夹型资源包直接读，``.zip`` 从压缩包里取；任何异常都静默返回 ``None``，
+    由调用方回退到占位图。
+    """
+    import zipfile
+
+    root = Path(path)
+    try:
+        if root.is_dir():
+            icon = root / PACK_ICON_NAME
+            return icon.read_bytes() if icon.is_file() else None
+        if not root.is_file():
+            return None
+        # 注意：``xxx.zip.disabled`` 本身就是那个 zip 文件（只是被改了扩展名），
+        # zipfile 只按文件内容判断格式、不看后缀，所以直接打开即可。
+        with zipfile.ZipFile(root) as bundle:
+            try:
+                return bundle.read(PACK_ICON_NAME)
+            except KeyError:
+                return None
+    except (OSError, zipfile.BadZipFile):
+        return None
 
 
 @dataclass(frozen=True, slots=True)

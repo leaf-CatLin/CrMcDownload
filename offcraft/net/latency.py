@@ -220,6 +220,8 @@ class SourceRouter:
         )
         self._lock = threading.RLock()
         self._cache: dict[str, Decision] = {}
+        #: 正在探测中的 key -> Event：同一 key 并发进入时只探测一次，其余等结论
+        self._deciding: dict[str, threading.Event] = {}
         #: 已下发的下载地址 → 官方原始地址，用于过慢时重新改写
         self._reverse: dict[str, str] = {}
         self._last_rescan = 0.0
@@ -302,9 +304,28 @@ class SourceRouter:
             return first_mirror[1] if first_mirror is not None else url
         key = self._route_key(url)
         decision = self.decide_multi(key, candidates)
-        chosen = decision.url or candidates[0][1]
+        # 只复用「选了哪个源」这个结论，不能复用 Decision.url：路由缓存按 host 聚合
+        # （所有 launchermeta/piston-meta 地址共用 ``route:meta``），而 Decision.url 是
+        # **当时探测的那一个具体地址**。直接用它会把后续同路由的其它文件（例如
+        # java-runtime/all.json、各个版本 JSON）全部改写成那一个地址，表现为「下载到
+        # 的内容张冠李戴 / 清单解析失败」。
+        chosen = self._pick_candidate(decision, candidates)
         self._remember(url, chosen)
         return chosen
+
+    def _pick_candidate(
+        self, decision: Decision, candidates: list[tuple[str, str]]
+    ) -> str:
+        """按缓存结论里的「选中源」为**当前** url 重新拼一个候选地址。"""
+        source = str(decision.source or "")
+        for base, candidate in candidates:
+            if base == source:
+                return candidate
+        if decision.mode == "direct":
+            for base, candidate in candidates:
+                if not base:
+                    return candidate
+        return candidates[0][1]
 
     def _route_key(self, url: str) -> str:
         host = (urlsplit(url).hostname or "").lower()
@@ -428,18 +449,31 @@ class SourceRouter:
     def decide_multi(
         self, key: str, candidates: Iterable[tuple[str, str]]
     ) -> Decision:
-        """多源择优：按综合评分排序并缓存。"""
+        """多源择优：按综合评分排序并缓存。
+
+        网络探测**不持锁**：旧实现把 ``measure_stats``（最长 2×5s 的采样）
+        放在 ``with self._lock`` 里，同一时刻其它线程的任何路由决策都会排队，
+        表现为「点了 Java 页之后整个下载页都不响应」。现在只对缓存读写加锁，
+        探测本身在锁外做；同一 key 并发进来时用「探测中」标记避免重复探测。
+        """
         items = list(candidates)
         cached = self._cached(key)
         if cached is not None:
             return cached
         with self._lock:
-            cached = self._cache.get(key)
-            if (
-                cached is not None
-                and self.ttl > 0
-                and (time.monotonic() - cached.at) < self.ttl
-            ):
+            in_flight = self._deciding.get(key)
+        if in_flight is not None:
+            # 另一个线程正在测同一批候选：等它的结论（最多等到它的 timeout 上限）
+            in_flight.wait(timeout=self.timeout * max(1, self.samples) * len(items) + 1.0)
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
+        gate = threading.Event()
+        with self._lock:
+            self._deciding[key] = gate
+        try:
+            cached = self._cached(key)
+            if cached is not None:
                 return cached
             self._flush()
             rows: list[dict[str, object]] = []
@@ -496,8 +530,13 @@ class SourceRouter:
                 candidates=tuple(rows),
                 detail_text=detail_text,
             )
-            self._cache[key] = decision
+            with self._lock:
+                self._cache[key] = decision
             return decision
+        finally:
+            with self._lock:
+                self._deciding.pop(key, None)
+            gate.set()
 
     def rank(
         self, candidates: Iterable[tuple[str, str]], key: str, probe_path: str = "/"

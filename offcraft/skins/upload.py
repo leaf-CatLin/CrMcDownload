@@ -22,7 +22,11 @@ __all__ = [
     "detect_model",
     "fetch_skin",
     "inspect_skin",
+    "load_slot_skin",
+    "local_skin_path",
     "list_skins",
+    "remove_slot_skin",
+    "save_slot_skin",
     "load_local_skin",
     "read_skin",
     "remove_local_skin",
@@ -239,6 +243,59 @@ def remove_local_skin(name: str) -> bool:
     for filename in (f"{name}.png", f"{name}_slim.png"):
         try:
             (skin_cache_dir() / filename).unlink()
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+# ---------------------------------------------------------------- 本地皮肤槽
+#: 皮肤不按用户名隔离：只有一个槽，换账户/换实例都用同一张（用户明确要求）。
+#: 存在 ``<数据目录>/skins/local.png``；同时还写 ``_slim`` 变体以记录模型。
+LOCAL_SLOT_NAME = "local"
+
+
+def local_skin_path(*, model: str = "classic") -> Path:
+    """本地皮肤槽的文件路径（``local.png`` / ``local_slim.png``）。"""
+    suffix = "_slim" if model == "slim" else ""
+    return skin_cache_dir() / f"{LOCAL_SLOT_NAME}{suffix}.png"
+
+
+def save_slot_skin(data: bytes, *, model: str = "classic") -> Path:
+    """把皮肤写进本地槽（不按用户名）。切换模型时删掉另一种，避免读到旧模型。"""
+    directory = skin_cache_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = local_skin_path(model=model)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+    other = local_skin_path(model="classic" if model == "slim" else "slim")
+    if other != path:
+        try:
+            other.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def load_slot_skin() -> tuple[bytes, str] | None:
+    """读本地槽，返回 ``(data, model)``；没有皮肤返回 ``None``。"""
+    for model in ("classic", "slim"):
+        try:
+            data = local_skin_path(model=model).read_bytes()
+        except OSError:
+            continue
+        if data:
+            return data, model
+    return None
+
+
+def remove_slot_skin() -> bool:
+    """清掉本地槽（两种模型都删）。"""
+    removed = False
+    for model in ("classic", "slim"):
+        try:
+            local_skin_path(model=model).unlink()
             removed = True
         except OSError:
             pass

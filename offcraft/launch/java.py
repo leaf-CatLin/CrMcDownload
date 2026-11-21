@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ __all__ = [
     "detect_java",
     "export_java_cache",
     "list_java",
+    "list_java_cached",
     "prime_java_cache",
     "probe_java",
 ]
@@ -114,6 +116,27 @@ def probe_java(java_exe: Path | str) -> int | None:
             major = None
     _CACHE[key] = (mtime, major)
     return major
+
+
+#: ``list_java`` 的进程内结果缓存：(mc_dir, 时间戳) -> [JavaCandidate]。
+#: 目录 glob + 每个候选的 ``java -version`` 冷启动要 7-18ms，而设置页每次显示都会
+#: 调一次；5 分钟内复用即可，用户点「重新检测」时传 ``refresh=True`` 绕过。
+_LIST_CACHE: dict[str, tuple[float, list["JavaCandidate"]]] = {}
+#: 缓存有效期（秒）
+LIST_CACHE_TTL = 300.0
+
+
+def list_java_cached(
+    mc_dir: Path | str, *, refresh: bool = False, ttl: float = LIST_CACHE_TTL
+) -> list["JavaCandidate"]:
+    """带缓存的 :func:`list_java`（设置页 / 实例对话框用这个）。"""
+    key = str(Path(mc_dir))
+    cached = _LIST_CACHE.get(key)
+    if not refresh and cached is not None and time.monotonic() - cached[0] < ttl:
+        return list(cached[1])
+    found = list_java(mc_dir)
+    _LIST_CACHE[key] = (time.monotonic(), list(found))
+    return found
 
 
 def _add(candidates: list[JavaCandidate], path: Path | None, source: str) -> None:

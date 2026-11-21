@@ -19,6 +19,7 @@ from offcraft.content.modrinth import ContentError, ModrinthClient
 from offcraft.instances import Instance, instance_game_dir
 from offcraft.mirror import Mirror
 from offcraft.net.downloader import DownloadError, DownloadTask, Downloader
+from offcraft.skins.upload import local_skin_path
 
 __all__ = [
     "CSL_CONFIG_DIR",
@@ -68,27 +69,79 @@ def config_path_for(
     return instance_game_dir(mc_dir, instance.id, isolated) / CSL_CONFIG_DIR / CSL_CONFIG_NAME
 
 
-def build_config(base_url: str) -> dict[str, Any]:
-    """CSL 14.7+ 的 ``loadlist`` 格式；类型用 CustomSkinAPI 指向镜像的 ``/skin/``。"""
-    base = (base_url or "").rstrip("/") + "/"
-    return {
-        "enable": True,
-        "loadlist": [
-            {
-                "name": "CrMCDownload",
-                "type": "CustomSkinAPI",
-                "root": base,
-            },
-            {"name": "Mojang", "type": "MojangAPI"},
-        ],
-    }
+def local_skin_root() -> Path | None:
+    """CSL ``LocalSkin`` 要的目录：里面放 ``<用户名>.png``。
+
+    本启动器只维护一个本地槽（``local.png`` / ``local_slim.png``），
+    这里返回它的父目录；调用方还需要按当前用户名把文件映射成 ``<name>.png``
+    （见 :func:`sync_local_skin_file`）。没有本地皮肤时返回 ``None``。
+    """
+    try:
+        path = local_skin_path(model="classic")
+        if path.is_file():
+            return path.parent
+        path = local_skin_path(model="slim")
+        if path.is_file():
+            return path.parent
+    except OSError:
+        return None
+    return None
 
 
-def _write_config(path: Path, base_url: str) -> bool:
+def sync_local_skin_file(username: str, *, model: str = "classic") -> Path | None:
+    """把本地槽复制成 CSL 认识的 ``<username>.png``，返回该文件路径。"""
+    from shutil import copy2
+
+    name = str(username or "").strip()
+    if not name:
+        return None
+    source = local_skin_path(model=model)
+    if not source.is_file():
+        source = local_skin_path(model="classic" if model == "slim" else "slim")
+    if not source.is_file():
+        return None
+    target = source.with_name(f"{name}.png")
+    try:
+        if target != source:
+            copy2(source, target)
+        return target
+    except OSError:
+        return None
+
+
+def build_config(base_url: str, *, local_root: str = "") -> dict[str, Any]:
+    """CSL 14.7+ 的 ``loadlist`` 格式。
+
+    ``local_root`` 非空时把它作为 **LocalSkin** 源嵌进首位——CSL 的
+    ``LocalSkin`` 类型会直接从本地目录读 ``<root>/<用户名>.png``，
+    这样即使不联网、没有镜像，本地皮肤也能显示（用户要求保留 CSL 支持）。
+    """
+    loadlist: list[dict[str, Any]] = []
+    if local_root:
+        # 注意 LocalSkin 的 root 指向「存放 <name>.png 的目录」，末尾必须带 /
+        root = (local_root or "").rstrip("/") + "/"
+        loadlist.append({"name": "LocalSkin", "type": "LocalSkin", "root": root})
+    if base_url:
+        base = (base_url or "").rstrip("/") + "/"
+        loadlist.append(
+            {"name": "CrMCDownload", "type": "CustomSkinAPI", "root": base}
+        )
+    loadlist.append({"name": "Mojang", "type": "MojangAPI"})
+    return {"enable": True, "loadlist": loadlist}
+
+
+def _write_config(path: Path, base_url: str, local_root: str = "") -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(build_config(base_url), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(
+                build_config(base_url, local_root=local_root),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         tmp.replace(path)
         return True
     except OSError:
@@ -112,11 +165,14 @@ def ensure_installed(
             log("WARN", f"CSL：{text}")
 
     base_url = getattr(mirror, "base_url", "") or ""
-    if not base_url:
-        return CslStatus("no_base", note="未配置下载源，跳过皮肤 mod")
     loader = LOADERS.get(instance.loader)
     if loader is None:
         return CslStatus("missing_loader", note="原版实例不支持皮肤 mod（需 Fabric/Forge/NeoForge/Quilt）")
+    # 即使没有镜像源也要能配：CSL 的 LocalSkin 类型能直接吃本地目录，
+    # 这正是「本地皮肤 + CSL」并存的用法。
+    local_root = str(local_skin_root() or "")
+    if not base_url and not local_root:
+        return CslStatus("no_base", note="未配置下载源，跳过皮肤 mod")
 
     mods = mods_dir_for(mc_dir, instance, isolated=isolated)
     try:
@@ -128,13 +184,18 @@ def ensure_installed(
     existing = sorted(mods.glob(f"{CSL_JAR_PREFIX}*.jar"))
     # 配置文件必须放在 <游戏目录>/CustomSkinLoader/，放 mods/ 不会被读取。
     config_written = _write_config(
-        config_path_for(mc_dir, instance, isolated=isolated), base_url
+        config_path_for(mc_dir, instance, isolated=isolated),
+        base_url,
+        local_root=local_root,
     )
     if existing:
         return CslStatus("present", jar=existing[0].name, config_written=config_written, note="已存在 CustomSkinLoader")
 
     if cancel is not None and getattr(cancel, "is_set", lambda: False)():
         return CslStatus("failed", note="已取消", config_written=config_written)
+    if not base_url:
+        # 没有下载源就没法从 Modrinth 取 jar；配置已写好，等有源时再补装
+        return CslStatus("no_base", note="未配置下载源，CSL 配置已写但未安装 jar", config_written=config_written)
 
     try:
         client = ModrinthClient(base_url, downloader=downloader, source=getattr(downloader, "_source", None))

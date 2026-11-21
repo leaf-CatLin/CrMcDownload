@@ -43,13 +43,37 @@ class BuildConfigTests(unittest.TestCase):
         self.assertEqual(first["root"], "https://mirror.example/")
         self.assertEqual(entries[1]["type"], "MojangAPI")
 
+    def test_local_skin_prepended_when_given(self) -> None:
+        """有本地皮肤目录时，LocalSkin 排在首位（CSL 也支持本地皮肤）。"""
+        cfg = csl.build_config("https://mirror.example", local_root=r"C:\data\skins")
+        entries = cfg["loadlist"]
+        self.assertEqual(entries[0]["type"], "LocalSkin")
+        self.assertTrue(entries[0]["root"].endswith("/"))
+        self.assertEqual(entries[1]["type"], "CustomSkinAPI")
+        self.assertEqual(entries[2]["type"], "MojangAPI")
+
+    def test_local_skin_only_without_mirror(self) -> None:
+        """没有镜像源也要能写出可用配置（只有 LocalSkin + Mojang）。"""
+        cfg = csl.build_config("", local_root="/tmp/skins")
+        types = [item["type"] for item in cfg["loadlist"]]
+        self.assertEqual(types, ["LocalSkin", "MojangAPI"])
+
 
 class EnsureInstalledTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.mc = Path(self._tmp.name)
+        # 隔离本机皮肤目录：否则真实环境里有 local.png 会让 loadlist 多出 LocalSkin，
+        # 测试结果就取决于跑测试的机器有没有设过皮肤。
+        self._skins = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(
+            csl, "local_skin_path", side_effect=lambda model="classic": Path(self._skins.name) / f"{model}.png"
+        )
+        self._patch.start()
 
     def tearDown(self) -> None:
+        self._patch.stop()
+        self._skins.cleanup()
         self._tmp.cleanup()
 
     def test_no_base_skips(self) -> None:
@@ -83,6 +107,8 @@ class EnsureInstalledTests(unittest.TestCase):
             self.mc / "versions" / "1.20.4-fabric" / "CustomSkinLoader" / "CustomSkinLoader.json",
         )
         written = json.loads(config_path.read_text(encoding="utf-8"))
+        # 有镜像源时 loadlist 仍以镜像的 CustomSkinAPI 为主（本地 LocalSkin 只在
+        # 检测到本地皮肤时才加，见 test_local_skin_added_to_loadlist）
         self.assertEqual(written, csl.build_config("https://m.example"))
 
     def test_install_success(self) -> None:

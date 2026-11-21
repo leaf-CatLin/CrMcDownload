@@ -15,6 +15,7 @@ __all__ = [
     "JavaRuntimeError",
     "install_java_runtime",
     "list_java_runtimes",
+    "pick_runtime_for_major",
     "runtime_java_path",
 ]
 
@@ -121,6 +122,35 @@ def list_java_runtimes(
         raise JavaRuntimeError("Java 运行时清单为空")
     result.sort(key=lambda item: (item.major, item.component))
     return result
+
+
+def pick_runtime_for_major(
+    runtimes: list[JavaRuntime], required: int | None
+) -> JavaRuntime | None:
+    """为所需主版本挑一个最适合安装的运行时。
+
+    规则（与启动器的 Java 选择保持一致）：
+    1. 有精确同主版本的组件就用它（例如需要 17 → ``java-runtime-gamma``）；
+    2. 否则退到**更高的最小**主版本（需要 17 但没有 17 → 用 21，不要用 8）；
+    3. ``required`` 为空时优先 Java 8（原版老版本），再否则取最低可用版本。
+
+    返回 ``None`` 表示清单里没有任何可用组件。
+    """
+    if not runtimes:
+        return None
+    if required is None:
+        for runtime in runtimes:
+            if runtime.major == 8:
+                return runtime
+        return sorted(runtimes, key=lambda item: item.major)[0]
+    exact = [item for item in runtimes if item.major == required]
+    if exact:
+        return sorted(exact, key=lambda item: item.component)[0]
+    higher = [item for item in runtimes if item.major > required]
+    if higher:
+        return sorted(higher, key=lambda item: (item.major, item.component))[0]
+    # 清单里只有更低的版本：装它也比什么都没有强（启动时会给出明确版本错误）
+    return sorted(runtimes, key=lambda item: item.major)[-1]
 
 
 def install_java_runtime(

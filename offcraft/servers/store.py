@@ -354,7 +354,12 @@ class ServerStore:
         except (TypeError, ValueError):
             return None
 
-    def remember(self, result: ProbeResult) -> None:
+    def remember(self, result: ProbeResult, *, defer: bool = False) -> None:
+        """记录一次探测结果。
+
+        ``defer=True`` 时只更新内存、不落盘：批量刷新（一次 30 个服务器）应当
+        在循环外统一调用 :meth:`save`，否则会变成 30 次全量 JSON 原子写。
+        """
         key = key_of(result.host, result.port)
         with self._lock:
             self.cache[key] = (time.time(), result.to_json())
@@ -362,7 +367,8 @@ class ServerStore:
             if len(self.cache) > 64:
                 for old in sorted(self.cache, key=lambda k: self.cache[k][0])[: len(self.cache) - 64]:
                     self.cache.pop(old, None)
-        self.save()
+        if not defer:
+            self.save()
 
     def forget(self, host: str, port: int = DEFAULT_PORT) -> None:
         with self._lock:

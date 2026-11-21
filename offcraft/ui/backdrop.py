@@ -6,7 +6,9 @@
 2. 背景图片（PNG / GIF，等比铺满窗口，居中裁切）；
 3. 颜色蒙版：图片 + 颜色时在图片上蒙一层很淡的纯色；只有颜色时直接铺满。
 
-界面控件都是半透明的毛玻璃卡片，会透出这一层的颜色与纹理。
+界面控件是白底实色卡片（见 :mod:`offcraft.ui.tokens` 的 ``elev``），会与这一层
+形成可辨识的边界。渐变**预渲染成 QPixmap**：``paintEvent`` 只做一次 ``drawPixmap``，
+避免每次重绘都重建 QLinearGradient（2560×1440 下这一项就要 5.9ms）。
 """
 
 from __future__ import annotations
@@ -21,24 +23,27 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QWidget
 
+from offcraft.ui.tokens import TOKENS, TOKENS_PCL
+
 __all__ = ["Backdrop"]
 
 #: 颜色蒙版不透明度（0-255）：“很淡”的一层色膜
 TINT_ALPHA = 44
 
-#: 与 QSS 中 QMainWindow 的默认渐变保持一致
-_GRADIENT = (
-    (0.0, "#F7FAFF"),
-    (0.55, "#F2F6FC"),
-    (1.0, "#EDF2FA"),
-)
 
+def _gradient_stops(style: str = "default") -> tuple[tuple[float, str], ...]:
+    """按风格给出背景渐变（与 token 的 ``bg`` 同色系）。"""
+    if str(style or "").lower() == "pcl":
+        bg = TOKENS_PCL["color"]["bg"]
+        return ((0.0, "#FFFFFF"), (0.55, "#F3F8FF"), (1.0, bg))
+    bg = TOKENS["color"]["bg"]
+    return ((0.0, "#E6EDF8"), (0.55, bg), (1.0, "#B7C6DE"))
+
+
+#: 兼容旧引用
+_GRADIENT = _gradient_stops("default")
 #: 原版 PCL 风格的背景渐变（上白下浅蓝）
-_PCL_GRADIENT = (
-    (0.0, "#FFFFFF"),
-    (0.55, "#F3F8FF"),
-    (1.0, "#EAF2FE"),
-)
+_PCL_GRADIENT = _gradient_stops("pcl")
 
 
 class Backdrop(QWidget):
@@ -49,17 +54,24 @@ class Backdrop(QWidget):
         self._color = QColor()
         self._image_path = ""
         self._gradient = _GRADIENT
+        self._style = "default"
         self._movie: QMovie | None = None
         self._pixmap: QPixmap | None = None
         self._scaled: QPixmap | None = None
         self._scaled_key: tuple[int, int, int, int] | None = None
+        #: 预渲染的渐变底（尺寸变化时重建）
+        self._base: QPixmap | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
 
     # ---------------------------------------------------------------- 设置
     def set_appearance(self, color: str = "", image: str = "", style: str = "default") -> None:
         """``color`` 为 ``#RRGGBB``（空 = 无色），``image`` 为 PNG/GIF 路径（空 = 无图）。"""
         self._color = QColor(color) if color else QColor()
-        self._gradient = _PCL_GRADIENT if str(style or "").lower() == "pcl" else _GRADIENT
+        style = str(style or "default").lower()
+        if style != self._style:
+            self._style = style
+            self._gradient = _PCL_GRADIENT if style == "pcl" else _GRADIENT
+            self._base = None
         if image != self._image_path:
             self._image_path = image
             self._load_image(image)
@@ -104,8 +116,28 @@ class Backdrop(QWidget):
                 return frame
         return self._pixmap
 
+    def _base_pixmap(self, size: QSize) -> QPixmap | None:
+        """预渲染整窗渐变；只在尺寸或风格变化时重建一次。"""
+        if size.width() <= 0 or size.height() <= 0:
+            return None
+        if self._base is not None and self._base.size() == size:
+            return self._base
+        base = QPixmap(size)
+        painter = QPainter(base)
+        gradient = QLinearGradient(0, 0, size.width() * 0.35, size.height())
+        for stop, color in self._gradient:
+            gradient.setColorAt(stop, QColor(color))
+        painter.fillRect(base.rect(), gradient)
+        painter.end()
+        self._base = base
+        return base
+
     def _cover_pixmap(self, pixmap: QPixmap, size: QSize) -> QPixmap | None:
-        """等比放大到铺满目标区域，并把缩放结果按帧缓存，避免 GIF 每帧重复解码。"""
+        """等比放大到铺满目标区域，并把缩放结果按帧缓存，避免 GIF 每帧重复解码。
+
+        缩放用 ``FastTransformation``：背景图是「铺满后裁切」的展示用途，
+        平滑缩放在整窗尺寸下每帧要 10ms 以上，视觉收益却几乎为零。
+        """
         if size.width() <= 0 or size.height() <= 0:
             return None
         frame_index = self._movie.currentFrameNumber() if self._movie is not None else 0
@@ -115,7 +147,7 @@ class Backdrop(QWidget):
         scaled = pixmap.scaled(
             size,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         self._scaled = scaled
         self._scaled_key = key
@@ -123,20 +155,18 @@ class Backdrop(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
 
-        # 1) 默认渐变做兜底（图片 PNG/GIF 带透明通道时不会露出黑色底）
-        gradient = QLinearGradient(
-            rect.left(), rect.top(), rect.left() + rect.width() * 0.35, rect.bottom()
-        )
-        for stop, color in self._gradient:
-            gradient.setColorAt(stop, QColor(color))
-        painter.fillRect(rect, gradient)
+        # 1) 预渲染的渐变底（图片带透明通道时不会露出黑色）
+        base = self._base_pixmap(rect.size())
+        if base is not None:
+            painter.drawPixmap(0, 0, base)
+        else:
+            painter.fillRect(rect, QColor(self._gradient[-1][1]))
 
-        # 2) 背景图片（等比铺满，居中裁切）
         frame = self._current_pixmap()
         if frame is not None:
+            # 2) 背景图片（等比铺满，居中裁切）
             scaled = self._cover_pixmap(frame, rect.size())
             if scaled is not None:
                 painter.drawPixmap(

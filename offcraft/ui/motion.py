@@ -1,7 +1,12 @@
-"""轻量动效：控件进场淡入、按钮点击波纹与按下收缩、列表错开出现。
+"""轻量动效：控件进场淡入与按钮点击波纹。
 
-全部基于 Qt 属性动画与自绘，不引入图片资源；淡入结束后会把
-``QGraphicsOpacityEffect`` 停用，避免长期挂在控件上拖慢绘制。
+两条性能纪律（此前都踩过）：
+
+1. 淡入结束后**必须卸载** ``QGraphicsOpacityEffect``。保留它会把这个控件
+   （整页页面时是整页）的每次绘制都路由到离屏 pixmap 再合成；导航几轮后会残留
+   若干个 effect，直接吃掉帧预算。
+2. 波纹用**每页一个复用的覆盖层**，不再每次点击都 new 一个铺满按钮的 QWidget：
+   后者会让点击瞬间多出一次全尺寸合成，快速连点时尤其明显。
 """
 
 from __future__ import annotations
@@ -30,10 +35,10 @@ from offcraft.ui.theme import ACCENT
 __all__ = ["MotionFilter", "fade_in", "install", "stagger"]
 
 #: 淡入时长（毫秒）与列表错开的最大间隔
-FADE_MS = 220
-STAGGER_MS = 45
+FADE_MS = 180
+STAGGER_MS = 40
 #: 波纹动画时长
-PRESS_MS = 90
+RIPPLE_MS = 320
 
 
 def _alive(widget) -> bool:
@@ -75,17 +80,18 @@ def fade_in(widget: QWidget, *, duration: int = FADE_MS) -> None:
 
 
 def _finish(widget: QWidget, effect: QGraphicsOpacityEffect, anim: QPropertyAnimation) -> None:
-    if not _alive(widget) or not _alive(effect):
-        return
-    try:
-        if widget.graphicsEffect() is effect:
-            effect.setOpacity(1.0)  # 保持启用，避免反复启停影响布局与绘制
-    except RuntimeError:
-        pass
+    """淡入完成：彻底摘掉 effect，让控件回到普通绘制路径。"""
     try:
         widget._fade_anim = None  # noqa: SLF001
     except RuntimeError:
         pass
+    if _alive(widget) and _alive(effect):
+        try:
+            if widget.graphicsEffect() is effect:
+                effect.setOpacity(1.0)
+                widget.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
     if _alive(anim):
         anim.deleteLater()
 
@@ -104,88 +110,97 @@ def stagger(widgets, *, step: int = STAGGER_MS, duration: int = FADE_MS) -> None
             fade_in(widget, duration=duration)
 
 
-class _Ripple(QWidget):
-    """从点击位置向外扩散的圆形波纹，画完即销毁。"""
+class _RippleLayer(QWidget):
+    """按钮内的波纹层：每次点击复用同一个子控件，只重设起点与半径。
 
-    def __init__(self, parent: QWidget, origin: QPointF, color: QColor) -> None:
+    波纹必须限制在按钮自己的矩形里（``parent.rect()``）。曾经为了省一次
+    new 控件，把它挂到整个窗口上并按窗口矩形绘制 —— 于是点任何按钮都变成
+    「全屏扩散的水波」，这属于把性能优化做过头了：正确做法是让波纹层的父控件
+    就是按钮本身，这样既有复用、又天然被按钮裁剪。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self.setGeometry(parent.rect())
-        self._origin = origin
-        self._color = QColor(color)
-        self._progress = 0.0
+        self._origin = QPointF()
+        self._color = QColor(ACCENT)
+        self._reach = 1.0
+        self._progress = 1.0
         self._anim = QVariantAnimation(self)
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
-        self._anim.setDuration(380)
+        self._anim.setDuration(RIPPLE_MS)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._on_value)
-        self._anim.finished.connect(self.deleteLater)
-        self.raise_()
+        self.hide()
+
+    def play(self, rect, origin: QPointF, color: QColor) -> None:
+        """``rect`` 是父控件（按钮）的矩形，``origin`` 是按钮内的坐标。"""
+        self._origin = origin
+        self._color = QColor(color)
+        # 半径只需覆盖按钮自己的四个角
+        self._reach = max(
+            1.0,
+            (origin - QPointF(rect.topLeft())).manhattanLength(),
+            (origin - QPointF(rect.bottomRight())).manhattanLength(),
+            (origin - QPointF(rect.topRight())).manhattanLength(),
+            (origin - QPointF(rect.bottomLeft())).manhattanLength(),
+        )
+        self._progress = 0.0
+        self.setGeometry(rect)
         self.show()
+        self.raise_()
+        self._anim.stop()
         self._anim.start()
 
     def _on_value(self, value) -> None:
         self._progress = float(value)
         self.update()
+        if self._progress >= 1.0:
+            self.hide()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        if self._progress <= 0:
+        if self._progress >= 1.0 or self._progress <= 0.0:
             return
-        reach = 1.0
-        for corner in (
-            self.rect().topLeft(),
-            self.rect().topRight(),
-            self.rect().bottomLeft(),
-            self.rect().bottomRight(),
-        ):
-            dx = abs(self._origin.x() - corner.x())
-            dy = abs(self._origin.y() - corner.y())
-            reach = max(reach, dx + dy)
-        radius = reach * self._progress
+        radius = self._reach * self._progress
         color = QColor(self._color)
-        color.setAlpha(int(self._color.alpha() * (1.0 - self._progress)))
+        color.setAlpha(max(0, int(self._color.alpha() * (1.0 - self._progress))))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(self._origin, radius, radius)
+        painter.end()
 
 
 class MotionFilter(QObject):
-    """全局事件过滤器：给所有按钮加点击波纹与轻微按下收缩。"""
+    """全局事件过滤器：给所有按钮加点击波纹。"""
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt 命名
         if not isinstance(obj, QAbstractButton):
             return False
-        etype = event.type()
-        if etype == QEvent.Type.MouseButtonPress:
+        if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton and obj.isEnabled():
-                self._press(obj, event.position())
-        elif etype in (
-            QEvent.Type.MouseButtonRelease,
-            QEvent.Type.Leave,
-            QEvent.Type.Hide,
-        ):
-            self._release(obj)
+                self._ripple(obj, event.position())
         return False
-
-    # ------------------------------------------------------------------ 内部
-    def _press(self, button: QAbstractButton, position: QPointF) -> None:
-        self._ripple(button, position)
-
-    def _release(self, button: QAbstractButton) -> None:
-        """松开时不需要额外处理：波纹动画自己结束并销毁。"""
 
     @staticmethod
     def _ripple(button: QAbstractButton, position: QPointF) -> None:
-        accent = button.objectName() in ("accent", "accentBig")
-        color = QColor(255, 255, 255, 120) if accent else QColor(ACCENT)
+        accent = button.objectName() in ("accent", "accentBig", "primary")
+        color = QColor(255, 255, 255, 110) if accent else QColor(ACCENT)
         if not accent:
-            color.setAlpha(46)
+            color.setAlpha(34)
+        # 波纹层是按钮的子控件：天然被按钮矩形裁剪，且同一按钮的所有点击复用它
+        layer = getattr(button, "_ripple_layer", None)
+        if layer is None or not _alive(layer):
+            try:
+                layer = _RippleLayer(button)
+            except RuntimeError:
+                return
+            button._ripple_layer = layer  # noqa: SLF001 - 挂在按钮上保引用
         try:
-            _Ripple(button, position, color)
+            layer.play(button.rect(), position, color)
         except RuntimeError:
             pass
 

@@ -477,7 +477,7 @@ class InstallPage(QWidget):
                     key, mc_version, mirror=source, downloader=downloader, limit=40
                 )
             except Exception as exc:  # noqa: BLE001 - 展示给用户
-                self.window.post(lambda: self._versions_failed(token, key, str(exc)))
+                self.window.post(lambda text=str(exc): self._versions_failed(token, key, text))
                 return
             self.window.post(lambda: self._versions_loaded(token, key, builds))
 

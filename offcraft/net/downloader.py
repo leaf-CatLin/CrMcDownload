@@ -35,6 +35,28 @@ __all__ = [
 
 _CHUNK = 256 * 1024
 
+#: 进程级共享的 TLS 上下文。
+#:
+#: ``ssl.create_default_context()`` 会把系统证书库整个载入（Windows 上枚举
+#: CertStore 的 78 张证书），实测**每次 22ms**。而下载页每加载一个内容图标就会
+#: new 一个 ``Downloader``：60 张图标 = 60 次证书库枚举，全部在 GIL 下排队，
+#: 主线程被饿死到「未响应」。上下文本身是只读、线程安全的一次性产物，
+#: 进程内共享一份即可。
+_SSL_CONTEXT: ssl.SSLContext | None = None
+_SSL_LOCK = threading.Lock()
+
+
+def shared_ssl_context() -> ssl.SSLContext:
+    """返回进程级共享的默认 TLS 上下文（首次调用时创建）。"""
+    global _SSL_CONTEXT
+    context = _SSL_CONTEXT
+    if context is not None:
+        return context
+    with _SSL_LOCK:
+        if _SSL_CONTEXT is None:
+            _SSL_CONTEXT = ssl.create_default_context()
+        return _SSL_CONTEXT
+
 #: 单文件下载速率低于该值（字节/秒）即视为「过慢」
 SLOW_THRESHOLD = 256 * 1024
 #: 慢速判定的观察窗口（秒）
@@ -240,7 +262,9 @@ class Downloader:
         self.stall_switches = max(0, int(stall_switches))
         #: 下载过慢时的换源回调：输入当前下载地址，返回新地址或 None
         self.url_resolver = url_resolver
-        self._ssl = ssl.create_default_context()
+        # 共享 TLS 上下文：每个 Downloader 单独创建要 22ms（枚举系统证书库），
+        # 图标批量加载时会把主线程饿死。见 shared_ssl_context 的说明。
+        self._ssl = shared_ssl_context()
         self._last_progress = 0.0
         self._pool = threading.local()
 

@@ -8,7 +8,12 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from offcraft.content.modrinth import ContentError, ModrinthClient, ProjectVersion
+from offcraft.content.modrinth import (
+    ContentError,
+    Dependency,
+    ModrinthClient,
+    ProjectVersion,
+)
 from offcraft.net.downloader import Downloader, DownloadTask
 
 __all__ = [
@@ -84,6 +89,53 @@ def download_file(
         dest.unlink(missing_ok=True)
         raise ContentInstallError(f"SHA-512 校验失败：{dest.name}")
     return dest
+
+
+def installed_names(dest_dir: Path | str) -> set[str]:
+    """目标目录里已装文件的小写名集合（用于判断某个项目是否已存在）。"""
+    try:
+        return {item.name.lower() for item in Path(dest_dir).iterdir() if item.is_file()}
+    except OSError:
+        return set()
+
+
+def missing_dependencies(
+    client: ModrinthClient,
+    version: ProjectVersion,
+    dest_dir: Path | str,
+) -> list[Dependency]:
+    """找出 ``version`` 的**必需依赖**里，目标目录中还没有的那些。
+
+    判断方式：依赖给了 ``file_name`` 就按文件名比对；否则用 ``project_id``
+    去问 Modrinth 拿默认项目名 slug，再按 ``<slug>-*.jar`` 前缀匹配。
+    这样「已装前置」不会重复下载，「缺前置」能准确报出来。
+    """
+    present = installed_names(dest_dir)
+    if not present:
+        return [dep for dep in version.dependencies if dep.required]
+    missing: list[Dependency] = []
+    for dep in version.dependencies:
+        if not dep.required:
+            continue
+        name = (dep.file_name or "").lower()
+        if name:
+            if name not in present and f"{name}.disabled" not in present:
+                missing.append(dep)
+            continue
+        # 没有文件名：按项目 slug 前缀猜（Modrinth 的文件名通常以 slug 开头）
+        slug = ""
+        if dep.project_id:
+            try:
+                meta = client.project(dep.project_id) or {}
+                slug = str(meta.get("slug") or "").lower()
+            except (ContentError, AttributeError, TypeError):
+                slug = ""
+        if slug and any(
+            item.startswith(slug) or item.startswith(f"{slug}-") for item in present
+        ):
+            continue
+        missing.append(dep)
+    return missing
 
 
 def install_project_version(

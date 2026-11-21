@@ -13,6 +13,7 @@ from typing import Any
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -34,9 +35,12 @@ from offcraft.servers.directory import DirectoryError, ServerDirectory, ServerLi
 from offcraft.servers.ping import ProbeResult, ping_server
 from offcraft.servers.store import ServerEntry, ServerStore
 from offcraft.ui.theme import MUTED, block_pixmap, human_count
-from offcraft.ui.widgets import Badge, Card, ElidedLabel
+from offcraft.ui.widgets import Badge, Card, ElidedLabel, EmptyState, style_menu
 
-__all__ = ["OnlinePage"]
+__all__ = ["AUTO_REFRESH_SECONDS", "OnlinePage"]
+
+#: 联机页自动刷新间隔（秒）：服务器在线状态会变，5 秒一次足够及时又不至于刷屏
+AUTO_REFRESH_SECONDS = 5.0
 
 SECTIONS = [
     ("hot", "热门"),
@@ -92,14 +96,14 @@ class ComplaintDialog(QDialog):
         layout.setSpacing(8)
 
         title = QLabel(f"举报 {listing.name}")
-        title.setStyleSheet("font-weight: 700;")
+        title.setProperty("role", "bodyStrong")
         layout.addWidget(title)
         hint = QLabel(
             "举报会发送服务器地址、举报原因、说明与可选联系方式，由人工审核；不会公开你的身份。"
             "只有你点击「提交举报」后才会发送。"
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {MUTED};")
+        hint.setObjectName("muted")
         layout.addWidget(hint)
 
         self.reason = QComboBox()
@@ -166,7 +170,7 @@ class ServerCard(QWidget):
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
         self.title = ElidedLabel(listing.name)
-        self.title.setStyleSheet("font-size: 10.5pt; font-weight: 700;")
+        self.title.setProperty("role", "bodyStrong")
         title_row.addWidget(self.title, 1)
         self.version = Badge("—", "blue")
         title_row.addWidget(self.version)
@@ -176,13 +180,13 @@ class ServerCard(QWidget):
         body.addLayout(title_row)
 
         self.motd = ElidedLabel(" ")
-        self.motd.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.motd.setObjectName("muted")
         body.addWidget(self.motd)
 
         meta = QHBoxLayout()
         meta.setSpacing(10)
         self.players = QLabel()
-        self.players.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        self.players.setObjectName("muted")
         self.latency = Badge("…", "gray")
         meta.addWidget(self.players)
         meta.addWidget(self.latency)
@@ -191,7 +195,7 @@ class ServerCard(QWidget):
 
         self.detail = QLabel()
         self.detail.setWordWrap(True)
-        self.detail.setStyleSheet(f"color: {MUTED}; font-size: 8.5pt;")
+        self.detail.setObjectName("muted")
         self.detail.setVisible(False)
         body.addWidget(self.detail)
 
@@ -222,6 +226,7 @@ class ServerCard(QWidget):
             button.setMinimumHeight(28)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             menu = QMenu(button)
+            style_menu(menu)
             for text, handler in manage:
                 menu.addAction(text, handler)
             button.setMenu(menu)
@@ -303,6 +308,8 @@ class OnlinePage(QWidget):
         self._icons: dict[str, bytes] = {}
         self._cards: dict[str, ServerCard] = {}
         self._refreshing = False
+        #: 5 秒自动刷新定时器（页面可见且窗口在用才跑）
+        self._auto_timer: QTimer | None = None
         self._loaded = False
         self._build()
 
@@ -350,7 +357,7 @@ class OnlinePage(QWidget):
 
         column.addStretch(1)
         self.status_label = QLabel(" ")
-        self.status_label.setStyleSheet(f"color: {MUTED};")
+        self.status_label.setObjectName("muted")
         column.addWidget(self.status_label)
 
         self.scroll = QScrollArea()
@@ -375,9 +382,52 @@ class OnlinePage(QWidget):
         self.store.load()
         if self._loaded:
             self._rebuild()
+            self.resume_auto_refresh()
             return
         self._loaded = True
         self.refresh()
+        self.resume_auto_refresh()
+
+    # -------------------------------------------------- 5 秒自动刷新
+    def resume_auto_refresh(self) -> None:
+        """开始/恢复 5 秒自动刷新（页面可见且窗口被使用时才真正跑）。
+
+        联机页显示的是服务器在线状态，天然是「会变的」数据；每 5 秒静默刷新一次，
+        玩家不用一直点刷新。自动刷新走 ``refresh()`` 的同一条后台线程路径，
+        并用 ``_refreshing`` 互斥，不会叠加请求。
+        """
+        if self._auto_timer is None:
+            self._auto_timer = QTimer(self)
+            self._auto_timer.setInterval(int(AUTO_REFRESH_SECONDS * 1000))
+            self._auto_timer.timeout.connect(self._auto_refresh_tick)
+        if self.isVisible() and self._loaded and not self._auto_timer.isActive():
+            self._auto_timer.start()
+
+    def suspend_auto_refresh(self) -> None:
+        """暂停自动刷新（切走页面 / 窗口最小化 / 长时间无操作）。"""
+        if self._auto_timer is not None and self._auto_timer.isActive():
+            self._auto_timer.stop()
+
+    def _auto_refresh_tick(self) -> None:
+        """自动刷新一次；窗口不可见或空闲时跳过（由 MainWindow 统一控制）。"""
+        if not self.isVisible() or not self._loaded:
+            self.suspend_auto_refresh()
+            return
+        gate = getattr(self.window, "loading_allowed", None)
+        if callable(gate) and not gate():
+            return
+        if self._refreshing:
+            return
+        self.refresh()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().showEvent(event)
+        if self._loaded:
+            self.resume_auto_refresh()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().hideEvent(event)
+        self.suspend_auto_refresh()
 
     def set_section(self, name: str) -> None:
         self._section = name
@@ -445,23 +495,42 @@ class OnlinePage(QWidget):
 
     # ---------------------------------------------------------------- 渲染
     def _rebuild(self) -> None:
-        for card in self._cards.values():
+        """按 ``listing.key`` 增量同步卡片：复用在位卡片，只增删差异项。
+
+        旧实现每次切分区都销毁并重建全部 ``ServerCard``（30 服 = 841 个控件、
+        636ms）。刷新时卡片内容本来就会通过 :meth:`_update_card` 更新，
+        没必要连控件一起重建。
+        """
+        rows = self._current_rows()
+        wanted = {listing.key for listing, _fav, _icon in rows}
+
+        # 1) 先删掉不再出现的卡片（含残留的空态提示）
+        for key in [key for key in self._cards if key not in wanted]:
+            card = self._cards.pop(key)
+            self.list_layout.removeWidget(card)
             card.setParent(None)
             card.deleteLater()
-        self._cards.clear()
-        # takeAt 只是把项从布局里摘掉，控件本身还在：必须手动删除，
-        # 否则切换分区后旧的空状态提示会叠在新卡片上。
-        while self.list_layout.count() > 1:
-            item = self.list_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        rows = self._current_rows()
-        for listing, favorited, icon in rows:
-            self._add_card(listing, favorited, icon)
+
+        # 2) 按目标顺序摆放：已有卡片只更新内容，缺的才新建
+        self._hint: QLabel | None = getattr(self, "_hint", None)
+        for index, (listing, favorited, icon) in enumerate(rows):
+            card = self._cards.get(listing.key)
+            if card is None:
+                card = ServerCard(
+                    self, listing, favorited, icon, manage=self._manage_actions(listing)
+                )
+                self._cards[listing.key] = card
+            else:
+                card.update(listing, favorited, icon)
+                self.list_layout.removeWidget(card)
+            self.list_layout.insertWidget(index, card)
         if not rows:
             self._add_hint()
+        elif getattr(self, "_hint", None) is not None:
+            hint = self._hint
+            self._hint = None
+            self.list_layout.removeWidget(hint)
+            hint.deleteLater()
 
     def _add_card(self, listing: ServerListing, favorited: bool, icon: bytes | None) -> ServerCard:
         card = ServerCard(
@@ -472,9 +541,14 @@ class OnlinePage(QWidget):
         return card
 
     def _add_hint(self) -> None:
-        label = QLabel(_EMPTY_HINTS.get(self._section, " "))
-        label.setStyleSheet(f"color: {MUTED}; padding: 24px;")
-        self.list_layout.insertWidget(self.list_layout.count() - 1, label)
+        """空分区提示：统一的空态组件，不再是一行灰字。"""
+        self._hint = EmptyState(
+            "globe",
+            "这里还没有服务器",
+            _EMPTY_HINTS.get(self._section, ""),
+            ("添加服务器", self.prompt_add),
+        )
+        self.list_layout.insertWidget(self.list_layout.count() - 1, self._hint)
 
     def _update_card(self, listing: ServerListing, favorited: bool, icon: bytes | None) -> None:
         card = self._cards.get(listing.key)
@@ -527,12 +601,14 @@ class OnlinePage(QWidget):
                 result = ping_server(entry.address, allow_local=allow_local)
                 if result.favicon:
                     self._icons[entry.key] = result.favicon
-                self.store.remember(result)
+                # 循环内只改内存，循环结束统一落盘一次（30 服 = 30 次原子写 → 1 次）
+                self.store.remember(result, defer=True)
                 listing = _listing_from(entry, result)
                 listing.visible = visible
                 fav = entry.key in favs
                 icon = self._icons.get(entry.key)
                 self.window.post(lambda l=listing, f=fav, i=icon: self._update_card(l, f, i))
+            self.store.save()
             self.window.post(self._end_refresh)
         except Exception as exc:  # noqa: BLE001 - 后台线程兜底
             message = str(exc) if isinstance(exc, DirectoryError) else f"刷新失败：{exc}"

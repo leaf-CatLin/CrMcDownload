@@ -1,4 +1,8 @@
-"""界面主题：PCL 风格的浅色卡片、蓝色强调色与程序化图标。
+"""界面主题：由设计 token 生成的 QSS + 程序化图标。
+
+颜色 / 字号 / 圆角 / 间距的唯一来源是 :mod:`offcraft.ui.tokens`；这里只负责把
+token 展开成 QSS，并提供 ``overlay`` 这类兼容旧调用点的派生值。改一处 token
+即可全局生效，也避免同一个界面出现 21 种字号、13 种圆角。
 
 不依赖任何图片资源：版本图标/项目图标都用 QPainter 画出来，
 因此打包后也不会缺资源。
@@ -9,9 +13,22 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from functools import lru_cache
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPixmap, QPolygonF
+
+from offcraft.ui.tokens import (
+    ELEVATION,
+    FONT_FAMILY,
+    FONT_MONO,
+    RADIUS,
+    SPACE,
+    TOKENS,
+    TOKENS_PCL,
+    TYPE,
+    style_tokens,
+)
 
 __all__ = [
     "ACCENT",
@@ -21,11 +38,22 @@ __all__ = [
     "BORDER",
     "CARD",
     "DANGER",
+    "ELEVATION",
+    "FONT_FAMILY",
+    "FONT_MONO",
     "MUTED",
     "OK",
+    "RADIUS",
+    "SELECTED",
+    "SELECTED_STRONG",
+    "HOVER_STRONG",
+    "SPACE",
     "TEXT",
+    "TOKENS",
+    "TYPE",
     "WARN",
     "app_qss",
+    "apply_role",
     "block_pixmap",
     "full_qss",
     "human_count",
@@ -36,19 +64,42 @@ __all__ = [
     "loader_pixmap",
     "overlay",
     "pcl_qss",
+    "style_tokens",
 ]
 
-BG = "#F2F6FC"
-CARD = "#FFFFFF"
-BORDER = "#E5EBF4"
-TEXT = "#1B2432"
-MUTED = "#7A8698"
-ACCENT = "#3A76E8"
-ACCENT_DARK = "#2558B8"
-ACCENT_SOFT = "#EAF1FF"
-OK = "#2E9E6B"
-WARN = "#D18B22"
-DANGER = "#D24B45"
+#: 兼容旧调用点的单一值别名（全部来自默认主题的 token）
+BG = TOKENS["color"]["bg"]
+CARD = TOKENS["color"]["surface"]
+BORDER = TOKENS["color"]["border"]
+TEXT = TOKENS["color"]["text"]
+MUTED = TOKENS["color"]["textMuted"]
+ACCENT = TOKENS["color"]["accent"]
+ACCENT_DARK = TOKENS["color"]["accentDark"]
+ACCENT_SOFT = TOKENS["color"]["accentSoft"]
+OK = TOKENS["color"]["ok"]
+WARN = TOKENS["color"]["warn"]
+DANGER = TOKENS["color"]["danger"]
+#: 半透明的选中/悬停色：叠在玻璃卡片或列表上仍能透出底色
+SELECTED = TOKENS["color"]["selected"]
+SELECTED_STRONG = TOKENS["color"]["selectedStrong"]
+HOVER_STRONG = TOKENS["color"]["hover"]
+
+
+def apply_role(widget, role: str):
+    """按字体档（caption/label/body/bodyStrong/h3/h2/h1/hero）设置控件角色。
+
+    QSS 里用 ``QLabel[role="h2"]`` 之类的属性选择器接管字号，从而不再需要
+    每处 ``setStyleSheet("font-size: 13pt; font-weight: 700;")``。
+    """
+    if widget is None:
+        return widget
+    widget.setProperty("role", role)
+    style = widget.style()
+    if style is not None:
+        style.unpolish(widget)
+        style.polish(widget)
+    widget.update()
+    return widget
 
 
 def _rgb(value: str) -> tuple[int, int, int]:
@@ -85,15 +136,17 @@ def overlay(
     alpha = min(ceiling, max(floor, 1 - tolerance / diff))
     return f"rgba({target[0]}, {target[1]}, {target[2]}, {alpha:.2f})"
 
-#: 毛玻璃：半透明白 + 亮边，让可自定义背景从卡片下透出来。
-#: 内层控件（输入框/按钮）叠在卡片上时两层 alpha 会相乘，若各自都接近不透明，
-#: 背景就被洗成白色，因此每一层都要明显更透。
+#: 旧的「毛玻璃」派生值：QSS 已改用 token 的实色底 + 1px 描边（对比度可见），
+#: 这里保留常量只为兼容 ``test_theme`` 与可能的外部调用，不再参与样式生成。
 GLASS = overlay("#FFFFFF")
 GLASS_SOFT = overlay("#F7F9FD", floor=0.42)
 GLASS_EDGE = overlay("#FFFFFF", tolerance=1.0)
 GLASS_INPUT = overlay("#FFFFFF", floor=0.55)
 GLASS_HOVER = overlay("#F0F5FD", floor=0.40)
 GLASS_PRESSED = overlay("#E2EAF8", floor=0.50)
+
+#: 完整样式表缓存：``setStyleSheet`` 会重刷窗口内所有控件，重复生成字符串没意义。
+_QSS_CACHE: dict[str, str] = {}
 
 #: 加载器/内容类型的标识色
 LOADER_COLORS = {
@@ -137,7 +190,7 @@ def loader_color(loader: str) -> str:
     return LOADER_COLORS.get(loader or "", PALETTE[_seed_value(loader) % len(PALETTE)])
 
 
-def block_pixmap(seed: str, size: int = 64, badge: str = "") -> QPixmap:
+def _block_pixmap(seed: str, size: int, badge: str) -> QPixmap:
     """画一个等轴测方块图标（草地方块风格），颜色由 ``seed`` 决定。"""
     ratio = 2
     pix = QPixmap(size * ratio, size * ratio)
@@ -218,7 +271,7 @@ def block_pixmap(seed: str, size: int = 64, badge: str = "") -> QPixmap:
     return pix
 
 
-def initial_pixmap(text: str, size: int = 44, seed: str = "") -> QPixmap:
+def _initial_pixmap(text: str, size: int, seed: str) -> QPixmap:
     """圆角方块 + 首字母，用于模组/整合包图标占位。"""
     ratio = 2
     pix = QPixmap(size * ratio, size * ratio)
@@ -244,7 +297,7 @@ def initial_pixmap(text: str, size: int = 44, seed: str = "") -> QPixmap:
     return pix
 
 
-def loader_pixmap(name: str, size: int = 44, dimmed: bool = False) -> QPixmap:
+def _loader_pixmap(name: str, size: int, dimmed: bool) -> QPixmap:
     """加载器徽标：圆角方块 + 简称（Fabric→Fa / NeoForge→NF / Forge→Fo）。"""
     ratio = 2
     pix = QPixmap(size * ratio, size * ratio)
@@ -270,6 +323,39 @@ def loader_pixmap(name: str, size: int = 44, dimmed: bool = False) -> QPixmap:
     painter.end()
     pix.setDevicePixelRatio(ratio)
     return pix
+
+
+#: 图标工厂缓存：``block_pixmap`` 每次调用要 0.22ms，版本表一次渲染 400 行就是 90ms。
+#: 参数（seed / size / badge…）完全决定输出，因此可以安全缓存；命中时拷贝一份——
+#: QPixmap 是隐式共享的，拷贝几乎零成本，但能避免调用方 setDevicePixelRatio 影响缓存对象。
+@lru_cache(maxsize=512)
+def _cached_block(seed: str, size: int, badge: str) -> QPixmap:
+    return _block_pixmap(seed, size, badge)
+
+
+@lru_cache(maxsize=512)
+def _cached_initial(text: str, size: int, seed: str) -> QPixmap:
+    return _initial_pixmap(text, size, seed)
+
+
+@lru_cache(maxsize=256)
+def _cached_loader(name: str, size: int, dimmed: bool) -> QPixmap:
+    return _loader_pixmap(name, size, dimmed)
+
+
+def block_pixmap(seed: str, size: int = 64, badge: str = "") -> QPixmap:
+    """画一个等轴测方块图标（带缓存）。"""
+    return QPixmap(_cached_block(str(seed), int(size), str(badge)))
+
+
+def initial_pixmap(text: str, size: int = 44, seed: str = "") -> QPixmap:
+    """圆角方块 + 首字母（带缓存）。"""
+    return QPixmap(_cached_initial(str(text), int(size), str(seed)))
+
+
+def loader_pixmap(name: str, size: int = 44, dimmed: bool = False) -> QPixmap:
+    """加载器徽标（带缓存）。"""
+    return QPixmap(_cached_loader(str(name), int(size), bool(dimmed)))
 
 
 def human_size(value: int | float) -> str:
@@ -322,10 +408,40 @@ def _qss_icon(name: str, color: str, size: int = 14) -> str:
         return ""
 
 
-def app_qss() -> str:
-    arrow_down = _qss_icon("chevron-down", "#6B7688", 14)
-    arrow_up = _qss_icon("chevron-up", "#6B7688", 14)
-    check = _qss_icon("check", "#FFFFFF", 16)
+def _font_pt(role: str) -> str:
+    """把字体档位换算成 QSS 里的 ``font-size`` + ``font-weight`` 声明。"""
+    size, weight = TYPE.get(role, TYPE["body"])
+    return f"font-size: {size}pt; font-weight: {weight};"
+
+
+def _role_rules(prefix: str = "") -> str:
+    """生成 ``QLabel[role="..."]`` 一类属性选择器，替代散落的内联字号。"""
+    out: list[str] = []
+    for role in TYPE:
+        out.append(f'{prefix}QLabel[role="{role}"] {{ {_font_pt(role)} }}')
+    for role in ("label", "body", "bodyStrong", "h3"):
+        out.append(f'{prefix}QPushButton[role="{role}"] {{ {_font_pt(role)} }}')
+    return "\n".join(out)
+
+
+def app_qss(style: str = "default") -> str:
+    """按 token 生成默认（浅色）界面样式。
+
+    所有颜色 / 字号 / 圆角 / 间距都来自 :func:`offcraft.ui.tokens.style_tokens`，
+    因此不再需要为「PCL 风格」维护第二份 340 行的重复选择器：换一份 token 即可。
+    """
+    t = style_tokens(style)
+    c = t["color"]
+    r = t["radius"]
+    elev_card = t["elev"]["card"]
+    elev_flat = t["elev"]["flat"]
+    elev_raised = t["elev"]["raised"]
+    field = t.get("field", c["surface"])
+    card_fill = elev_card["fill"]
+
+    arrow_down = _qss_icon("chevron-down", c["textMuted"], 14)
+    arrow_up = _qss_icon("chevron-up", c["textMuted"], 14)
+    check = _qss_icon("check", c["textOnAccent"], 16)
     down_arrow = (
         f"QComboBox::down-arrow {{ image: url({arrow_down}); width: 13px; height: 13px; }}"
         if arrow_down
@@ -338,15 +454,17 @@ def app_qss() -> str:
             f"QSpinBox::down-arrow {{ image: url({arrow_down}); width: 11px; height: 11px; }}"
         )
     check_icon = f"image: url({check});" if check else ""
+
     return f"""
+/* ---------------------------------------------------------------- 基础 */
 QWidget {{
     background: transparent;
-    color: {TEXT};
-    font-family: "Microsoft YaHei UI";
-    font-size: 10pt;
+    color: {c["text"]};
+    font-family: {FONT_FAMILY};
+    font-size: {TYPE["body"][0]}pt;
 }}
 /* 容器类控件一律透明，避免在卡片右侧露出默认白底 */
-QStackedWidget, QScrollArea, QListWidget, QTreeWidget, QListView, QTableView,
+QStackedWidget, QScrollArea, QListView, QTableView,
 QScrollArea > QWidget > QWidget {{
     background: transparent;
     border: none;
@@ -361,280 +479,313 @@ QAbstractScrollArea > QWidget,
 QAbstractItemView > QWidget {{
     background: transparent;
 }}
-QMainWindow, QDialog {{
-    background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
-        stop:0 #F7FAFF, stop:0.55 {BG}, stop:1 #EDF2FA);
-}}
-QFrame#topbar {{
-    background: rgba(255, 255, 255, 0.76);
-    border-bottom: 1px solid rgba(229, 235, 244, 0.85);
-}}
-QFrame#sidebar {{
-    background: rgba(255, 255, 255, 0.76);
-    border-right: 1px solid rgba(229, 235, 244, 0.85);
-}}
-QFrame#card {{
-    background: qlineargradient(x1:0, y1:0, x2:0.6, y2:1,
-        stop:0 {GLASS}, stop:1 {overlay("#FFFFFF", tolerance=8)});
-    border: 1px solid {GLASS_EDGE};
-    border-radius: 14px;
-}}
-QFrame#softCard {{
-    background: {GLASS_SOFT};
-    border: 1px solid {GLASS_EDGE};
-    border-radius: 12px;
-}}
-QFrame#tile {{
-    background: {GLASS_SOFT};
-    border: 1px solid {GLASS_EDGE};
-    border-radius: 12px;
-}}
-QFrame#tile:hover {{
-    background: rgba(234, 241, 255, 0.72);
-    border-color: #C9D8F5;
-}}
-QFrame#installHead {{
-    background: {GLASS};
-    border: 1px solid {GLASS_EDGE};
-    border-radius: 12px;
-}}
-QFrame#loaderRow {{
-    background: {GLASS_SOFT};
-    border: 1px solid {GLASS_EDGE};
-    border-radius: 12px;
-}}
-QFrame#loaderRow:hover {{
-    background: {GLASS_HOVER};
-    border-color: #C9D8F5;
-}}
-QFrame#loaderRow[picked="true"] {{
-    background: rgba(234, 241, 255, 0.82);
-    border: 2px solid {ACCENT};
-}}
-QFrame#loaderRow[dimmed="true"] {{
-    background: rgba(244, 246, 249, 0.55);
-    border-color: #E8ECF3;
-}}
-QLabel#dimTitle {{ color: #AEB6C4; font-size: 11pt; font-weight: 700; }}
-QLabel#dimText {{ color: #B6BDC9; font-size: 8.8pt; }}
-QLineEdit#dirName {{
-    font-size: 11.5pt;
-    font-weight: 700;
-    padding: 3px 8px;
+/* 主窗口背景由 Backdrop 绘制；对话框自己铺一层实色，避免透明叠透明 */
+QMainWindow {{ background: transparent; }}
+QDialog {{ background: {c["bg"]}; }}
+
+/* ---------------------------------------------------------------- 字体档 */
+{_role_rules()}
+QLabel#brand {{ {_font_pt("h2")} color: {c["text"]}; }}
+QLabel#brandSub {{ {_font_pt("caption")} color: {c["textMuted"]}; }}
+QLabel#pageTitle {{ {_font_pt("bodyStrong")} color: {c["text"]}; }}
+QLabel#title {{ {_font_pt("h1")}; }}
+QLabel#h2 {{ {_font_pt("h2")}; }}
+QLabel#h3 {{ {_font_pt("h3")}; }}
+QLabel#heroName {{ {_font_pt("hero")}; }}
+QLabel#muted {{ color: {c["textMuted"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#mutedSmall {{ color: {c["textMuted"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#status {{ color: {c["textMuted"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#error {{ color: {c["danger"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#link {{ color: {c["accent"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#versionTag {{ color: {c["textFaint"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#dimTitle {{ color: {c["textFaint"]}; {_font_pt("bodyStrong")} }}
+QLabel#dimText {{ color: {c["textFaint"]}; {_font_pt("caption")} }}
+QLabel#deviceCode {{
+    font-family: {FONT_MONO};
+    {_font_pt("hero")}
+    letter-spacing: 2px;
 }}
 QLabel#stepBadge {{
-    background: rgba(238, 243, 251, 0.70);
-    color: #5E6A7C;
-    border-radius: 8px;
+    background: {c["surfaceSunken"]};
+    color: {c["textMuted"]};
+    border-radius: {r["control"]}px;
     padding: 2px 8px;
-    font-size: 8.5pt;
+    {_font_pt("caption")}
 }}
-QLabel#brand {{ font-size: 14pt; font-weight: 700; color: {TEXT}; }}
-QLabel#pageTitle {{ font-size: 11pt; font-weight: 700; color: {TEXT}; }}
-QPushButton#quickTile {{
-    background: rgba(247, 249, 253, 0.60);
-    border: 1px solid rgba(229, 235, 244, 0.85);
-    border-radius: 9px;
+
+/* ---------------------------------------------------------------- 外壳 */
+QFrame#topbar {{
+    background: rgba(255, 255, 255, 0.72);
+    border-bottom: 1px solid {c["divider"]};
+}}
+QFrame#sidebar {{
+    background: rgba(255, 255, 255, 0.72);
+    border-right: 1px solid {c["divider"]};
+}}
+
+/* ---------------------------------------------------------------- 卡片 */
+QFrame#card {{
+    background: {elev_card["fill"]};
+    border: 1px solid {elev_card["border"]};
+    border-radius: {r["card"]}px;
+}}
+QFrame#softCard {{
+    background: {elev_flat["fill"]};
+    border: 1px solid {elev_flat["border"]};
+    border-radius: {r["control"]}px;
+}}
+QFrame#tile {{
+    background: {elev_flat["fill"]};
+    border: 1px solid {elev_flat["border"]};
+    border-radius: {r["control"]}px;
+}}
+QFrame#tile:hover {{
+    background: rgba(255, 255, 255, 0.82);
+    border-color: {c["accentSoftBorder"]};
+}}
+QFrame#installHead {{
+    background: {elev_raised["fill"]};
+    border: 1px solid {elev_raised["border"]};
+    border-radius: {r["card"]}px;
+}}
+QFrame#loaderRow {{
+    background: {elev_flat["fill"]};
+    border: 1px solid {elev_flat["border"]};
+    border-radius: {r["control"]}px;
+}}
+QFrame#loaderRow:hover {{
+    background: rgba(255, 255, 255, 0.82);
+    border-color: {c["accentSoftBorder"]};
+}}
+QFrame#loaderRow[picked="true"] {{
+    background: {c["accentSoft"]};
+    border: 2px solid {c["accent"]};
+}}
+QFrame#loaderRow[dimmed="true"] {{
+    background: {c["surfaceSunken"]};
+    border-color: {c["divider"]};
+}}
+
+/* ---------------------------------------------------------------- 按钮 */
+QPushButton {{
+    background: {field};
+    color: {c["text"]};
+    border: 1px solid {c["border"]};
+    border-radius: {r["control"]}px;
+    padding: 7px 14px;
+    min-height: 18px;
+}}
+QPushButton:hover {{ background: rgba(234, 241, 255, 0.88); border-color: {c["accentSoftBorder"]}; }}
+/* 按下只换底色，不再改 padding：位移会让文字“跳”一下，是廉价感的来源 */
+QPushButton:pressed {{ background: {c["pressed"]}; border-color: {c["accentSoftBorder"]}; }}
+QPushButton:disabled {{
+    color: {c["textFaint"]};
+    background: {c["surfaceSunken"]};
+    border-color: {c["divider"]};
+}}
+QPushButton#accent, QPushButton#primary {{
+    background: {c["accent"]};
+    color: {c["textOnAccent"]};
+    border: none;
+    border-radius: {r["control"]}px;
+    {_font_pt("bodyStrong")}
+    padding: 9px 18px;
+}}
+QPushButton#accent:hover, QPushButton#primary:hover {{ background: {c["accentHover"]}; }}
+QPushButton#accent:pressed, QPushButton#primary:pressed {{ background: {c["accentDark"]}; }}
+QPushButton#accent:disabled, QPushButton#primary:disabled {{
+    background: {c["accentSoftBorder"]};
+    color: {c["surface"]};
+}}
+QPushButton#accentBig {{
+    background: {c["accent"]};
+    color: {c["textOnAccent"]};
+    border: none;
+    border-radius: {r["card"]}px;
+    {_font_pt("h3")}
+}}
+QPushButton#accentBig:hover {{ background: {c["accentHover"]}; }}
+QPushButton#accentBig:pressed {{ background: {c["accentDark"]}; }}
+QPushButton#accentBig:disabled {{ background: {c["accentSoftBorder"]}; color: {c["surface"]}; }}
+QPushButton#ghost {{
+    background: transparent;
+    border: 1px solid {c["border"]};
+    color: {c["textMuted"]};
+}}
+QPushButton#ghost:hover {{
+    background: {c["accentSoft"]};
+    border-color: {c["accentSoftBorder"]};
+    color: {c["text"]};
+}}
+QPushButton#danger {{
+    color: {c["danger"]};
+    border-color: {c["danger"]};
+    background: {field};
+}}
+QPushButton#danger:hover {{ background: rgba(194, 69, 63, 0.08); }}
+QPushButton#nav {{
+    background: transparent;
+    border: none;
+    border-radius: {r["control"]}px;
     text-align: left;
-    padding: 7px 10px;
-    color: {TEXT};
+    padding: 9px 12px;
+    color: {c["textMuted"]};
+    {_font_pt("body")}
 }}
-QPushButton#quickTile:hover {{ background: rgba(234, 241, 255, 0.78); border-color: #C9D8F5; }}
-QPushButton#quickTile:checked {{
-    background: rgba(234, 241, 255, 0.82);
-    color: {ACCENT};
+QPushButton#nav:hover {{ background: {c["hover"]}; color: {c["text"]}; }}
+QPushButton#nav:checked {{
+    background: {c["accentSoft"]};
+    color: {c["accent"]};
     font-weight: 600;
 }}
-QLabel#brandSub {{ font-size: 8pt; color: {MUTED}; }}
-QLabel#title {{ font-size: 19pt; font-weight: 700; }}
-QLabel#h2 {{ font-size: 13pt; font-weight: 700; }}
-QLabel#h3 {{ font-size: 11pt; font-weight: 600; }}
-QLabel#deviceCode {{
-    font-family: "Consolas", "Cascadia Mono", monospace;
-    font-size: 18pt;
-    font-weight: 700;
-}}
-QLabel#muted {{ color: {MUTED}; font-size: 9pt; }}
-QLabel#mutedSmall {{ color: {MUTED}; font-size: 8pt; }}
-QLabel#heroName {{ font-size: 20pt; font-weight: 700; }}
-QLineEdit#heroName {{
-    font-size: 11pt;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 8px;
+QPushButton#navitem {{
     background: transparent;
-    border: 1px solid transparent;
+    border: none;
+    border-radius: {r["control"]}px;
+    text-align: left;
+    padding: 8px 12px;
+    color: {c["textMuted"]};
 }}
-QLineEdit#heroName:hover {{
-    background: rgba(255, 255, 255, 0.58);
-    border-color: rgba(229, 235, 244, 0.90);
+QPushButton#navitem:hover {{ background: {c["hover"]}; color: {c["text"]}; }}
+QPushButton#navitem:checked {{
+    background: {c["accentSoft"]};
+    color: {c["accent"]};
+    font-weight: 600;
 }}
-QLineEdit#heroName:focus {{ background: #FFFFFF; border-color: {ACCENT}; }}
-QComboBox#heroVersion {{
-    font-size: 13pt;
-    font-weight: 700;
-    padding: 4px 10px;
-    border-radius: 10px;
+QPushButton#topnav {{
+    background: transparent;
+    border: none;
+    border-radius: {r["control"]}px;
+    text-align: center;
+    padding: 6px 14px;
+    color: {c["textMuted"]};
+    {_font_pt("body")}
 }}
-QComboBox#heroVersion QAbstractItemView {{ font-size: 10pt; }}
-QPushButton#heroMenu {{
-    font-size: 16pt;
-    font-weight: 700;
-    color: {MUTED};
-    padding: 0px;
-    border-radius: 10px;
+QPushButton#topnav:hover {{ background: {c["hover"]}; color: {c["text"]}; }}
+QPushButton#topnav:checked {{
+    background: {c["accentSoft"]};
+    color: {c["accent"]};
+    font-weight: 600;
 }}
-QPushButton#heroMenu:hover {{ color: {TEXT}; }}
-QLabel#versionTag {{ color: #B4BCC9; font-size: 8pt; }}
-QListWidget#homeList {{ background: transparent; }}
-QListWidget#homeList::item {{ margin: 4px 2px; padding: 7px 6px; border-radius: 8px; }}
-/* 启动页左侧资源分类（模组 / 存档 / 资源 / 光影） */
+QPushButton#segment {{
+    background: transparent;
+    border: none;
+    border-radius: {r["control"]}px;
+    padding: 6px 16px;
+    color: {c["textMuted"]};
+}}
+QPushButton#segment:hover {{ color: {c["text"]}; background: {c["hover"]}; }}
+QPushButton#segment:checked {{
+    background: rgba(255, 255, 255, 0.86);
+    color: {c["accent"]};
+    font-weight: 600;
+    border: 1px solid {c["border"]};
+}}
+QPushButton#tile, QPushButton#quickTile {{
+    background: {elev_flat["fill"]};
+    border: 1px solid {elev_flat["border"]};
+    border-radius: {r["control"]}px;
+    text-align: left;
+    padding: 10px 12px;
+    color: {c["text"]};
+}}
+QPushButton#tile:hover, QPushButton#quickTile:hover {{
+    background: rgba(255, 255, 255, 0.86);
+    border-color: {c["accentSoftBorder"]};
+}}
+QPushButton#quickTile:checked {{
+    background: {c["accentSoft"]};
+    border-color: {c["accentSoftBorder"]};
+    color: {c["accent"]};
+    font-weight: 600;
+}}
 QPushButton#homeTab {{
     background: transparent;
     border: none;
-    border-radius: 8px;
-    padding: 4px 8px;
-    color: {MUTED};
-    font-size: 9pt;
+    border-radius: {r["control"]}px;
+    padding: 6px 10px;
+    color: {c["textMuted"]};
+    {_font_pt("body")}
     text-align: left;
 }}
-QPushButton#homeTab:hover {{ color: {TEXT}; background: rgba(238, 243, 251, 0.75); }}
+QPushButton#homeTab:hover {{ color: {c["text"]}; background: {c["hover"]}; }}
 QPushButton#homeTab:checked {{
-    color: {ACCENT};
+    color: {c["accent"]};
     font-weight: 600;
-    background: rgba(233, 241, 254, 0.90);
+    background: {c["accentSoft"]};
 }}
-QLabel#status {{ color: {MUTED}; font-size: 9pt; }}
-QLabel#error {{ color: {DANGER}; font-size: 9pt; }}
-QLabel#link {{ color: {ACCENT}; font-size: 9pt; }}
-/* 无边框窗口的自定义窗口按钮 */
+QPushButton#heroMenu {{
+    color: {c["textMuted"]};
+    padding: 0px;
+    border: none;
+    background: transparent;
+    border-radius: {r["control"]}px;
+    {_font_pt("h3")}
+}}
+QPushButton#heroMenu:hover {{ color: {c["text"]}; background: {c["hover"]}; }}
+QPushButton#accountCaption {{
+    background: transparent;
+    border: none;
+    color: {c["textMuted"]};
+    font-size: {TYPE["caption"][0]}pt;
+    padding: 0px;
+}}
+QPushButton#accountCaption:hover {{ color: {c["accent"]}; }}
+QLabel#dailyLine {{
+    color: {c["textFaint"]};
+    font-size: {TYPE["caption"][0]}pt;
+    padding: 2px 4px;
+}}
+QLabel#dailyLine:hover {{ color: {c["textMuted"]}; }}
+QLabel#statusDot {{ color: {c["ok"]}; font-size: {TYPE["h3"][0]}pt; }}
+
+/* ---------------------------------------------------------------- 窗口按钮 */
 QPushButton#winBtn {{
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: {r["control"]}px;
     padding: 0px;
 }}
-QPushButton#winBtn:hover {{ background: rgba(238, 243, 252, 0.80); }}
-QPushButton#winBtn:pressed {{ background: rgba(226, 234, 248, 0.88); }}
+QPushButton#winBtn:hover {{ background: {c["hover"]}; }}
+QPushButton#winBtn:pressed {{ background: {c["pressed"]}; }}
 QPushButton#winClose {{
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: {r["control"]}px;
     padding: 0px;
 }}
 QPushButton#winClose:hover {{ background: #FDE9E8; }}
 QPushButton#winClose:pressed {{ background: #F8D8D6; }}
-/* 小图标按钮（详情收起、颜色样本等） */
 QPushButton#iconBtn {{
     background: transparent;
     border: none;
-    border-radius: 7px;
+    border-radius: {r["control"]}px;
     padding: 0px;
 }}
-QPushButton#iconBtn:hover {{ background: rgba(238, 243, 252, 0.80); }}
-QPushButton#iconBtn:pressed {{ background: rgba(226, 234, 248, 0.88); }}
-QPushButton {{
-    background: {GLASS_INPUT};
-    border: 1px solid rgba(229, 235, 244, 0.95);
-    border-radius: 9px;
-    padding: 7px 14px;
-}}
-QPushButton:hover {{ background: {GLASS_HOVER}; border-color: #C9D8F5; }}
-QPushButton:pressed {{ background: {GLASS_PRESSED}; padding-top: 9px; padding-bottom: 5px; }}
-QPushButton:disabled {{ color: #AEB6C4; background: rgba(246, 248, 251, 0.50); border-color: rgba(229, 235, 244, 0.75); }}
-QPushButton#nav {{
-    background: transparent;
-    border: none;
-    border-radius: 9px;
-    text-align: left;
-    padding: 10px 14px;
-    color: #4B5565;
-    font-size: 10.5pt;
-}}
-QPushButton#nav:hover {{ background: rgba(241, 245, 253, 0.78); color: {TEXT}; }}
-QPushButton#topnav {{
-    background: transparent;
-    border: none;
-    border-radius: 10px;
-    text-align: center;
-    padding: 8px 18px;
-    color: #4B5565;
-    font-size: 10.5pt;
-}}
-QPushButton#topnav:hover {{ background: rgba(241, 245, 253, 0.78); color: {TEXT}; }}
-QPushButton#topnav:checked {{
-    background: rgba(234, 241, 255, 0.72);
-    color: {ACCENT};
-    font-weight: 700;
-}}
-QPushButton#nav:checked {{
-    background: rgba(234, 241, 255, 0.72);
-    color: {ACCENT};
-    font-weight: 700;
-}}
-QPushButton#accent {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #4A84F0, stop:1 {ACCENT});
-    color: #FFFFFF;
-    border: none;
-    border-radius: 9px;
-    font-weight: 700;
-    padding: 9px 18px;
-}}
-QPushButton#accent:hover {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #5A8FF5, stop:1 #4A84F0);
-}}
-QPushButton#accent:pressed {{ background: {ACCENT_DARK}; }}
-QPushButton#accent:disabled {{ background: #B9CDF0; color: #F4F7FD; }}
-QPushButton#accentBig {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #4A84F0, stop:1 {ACCENT});
-    color: #FFFFFF;
-    border: none;
-    border-radius: 12px;
-    font-size: 12.5pt;
-    font-weight: 700;
-}}
-QPushButton#accentBig:hover {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #5A8FF5, stop:1 #4A84F0);
-}}
-QPushButton#accentBig:pressed {{ background: {ACCENT_DARK}; }}
-QPushButton#accentBig:disabled {{ background: #B9CDF0; color: #F4F7FD; }}
-QPushButton#danger {{ color: {DANGER}; border-color: #F0C9C7; background: rgba(255, 246, 245, 0.62); }}
-QPushButton#danger:hover {{ background: rgba(253, 236, 234, 0.78); }}
-QPushButton#segment {{
-    background: transparent;
-    border: none;
-    border-radius: 7px;
-    padding: 6px 16px;
-    color: {MUTED};
-}}
-QPushButton#segment:hover {{ color: {TEXT}; background: rgba(238, 243, 251, 0.75); }}
-QPushButton#segment:checked {{
-    background: rgba(255, 255, 255, 0.70);
-    color: {ACCENT};
-    font-weight: 700;
-}}
-QPushButton#tile {{
-    background: rgba(247, 249, 253, 0.60);
-    border: 1px solid rgba(229, 235, 244, 0.85);
-    border-radius: 10px;
-    text-align: left;
-    padding: 10px 12px;
-    color: {TEXT};
-}}
-QPushButton#tile:hover {{ background: rgba(234, 241, 255, 0.78); border-color: #C9D8F5; }}
-QLineEdit, QSpinBox, QComboBox {{
-    background: {GLASS_INPUT};
-    border: 1px solid rgba(229, 235, 244, 0.95);
-    border-radius: 8px;
+QPushButton#iconBtn:hover {{ background: {c["hover"]}; }}
+QPushButton#iconBtn:pressed {{ background: {c["pressed"]}; }}
+
+/* ---------------------------------------------------------------- 输入 */
+QLineEdit, QSpinBox, QComboBox, QPlainTextEdit {{
+    background: {field};
+    color: {c["text"]};
+    border: 1px solid {c["border"]};
+    border-radius: {r["control"]}px;
     padding: 7px 10px;
+    selection-background-color: {c["accent"]};
+    selection-color: {c["textOnAccent"]};
 }}
-/* 选中色只给输入框：QComboBox 的选中色会传给下拉列表，导致弹层选中项变深蓝 */
-QLineEdit, QSpinBox {{ selection-background-color: {ACCENT}; }}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
+QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {c["borderStrong"]}; }}
+/* 焦点环：QSS 没有 box-shadow，用 2px 边框 + 收回 1px 内边距模拟，尺寸不变 */
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {{
+    border: 2px solid {c["focus"]};
+    padding: 6px 9px;
+}}
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+    background: {c["surfaceSunken"]};
+    color: {c["textFaint"]};
+    border-color: {c["divider"]};
+}}
 QComboBox::drop-down {{ border: none; width: 24px; background: transparent; }}
 {down_arrow}
 QSpinBox::up-button, QSpinBox::down-button {{
@@ -649,460 +800,224 @@ QSpinBox::down-button {{ subcontrol-position: bottom right; }}
 /* 下拉弹层（QComboBoxPrivateContainer）是独立的顶层窗口，其样式在
    offcraft/ui/widgets.py 的 style_combo_popup 里单独设置：弹层需要不透明白底，
    否则原生透明边距会在部分显卡/远程桌面下渲染成黑边。 */
+QLineEdit#dirName {{ {_font_pt("bodyStrong")} padding: 3px 8px; }}
+QLineEdit#heroName {{
+    {_font_pt("h3")}
+    padding: 2px 8px;
+    border-radius: {r["control"]}px;
+    background: transparent;
+    border: 1px solid transparent;
+}}
+QLineEdit#heroName:hover {{ background: {c["surface"]}; border-color: {c["border"]}; }}
+QLineEdit#heroName:focus {{ background: {c["surface"]}; border-color: {c["focus"]}; padding: 2px 8px; }}
+QComboBox#heroVersion {{
+    {_font_pt("h3")}
+    padding: 4px 10px;
+    border-radius: {r["control"]}px;
+}}
+QComboBox#heroVersion QAbstractItemView {{ {_font_pt("body")} }}
 QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{
     width: 18px; height: 18px; border-radius: 5px;
-    border: 1px solid #C7D0DE; background: {GLASS_INPUT};
+    border: 1px solid {c["borderStrong"]};
+    /* 未勾选：半透明，透出下层玻璃卡片 */
+    background: {field};
 }}
+QCheckBox::indicator:hover {{ border-color: {c["accent"]}; background: rgba(255, 255, 255, 0.9); }}
 QCheckBox::indicator:checked {{
-    background: {ACCENT}; border-color: {ACCENT};
+    /* 勾选态是品牌色，带一点透明以免在玻璃上显得突兀 */
+    background: rgba(58, 118, 232, 0.92); border-color: {c["accent"]};
     {check_icon}
 }}
 QCheckBox::indicator:disabled {{
-    background: rgba(242, 244, 248, 0.55); border-color: rgba(220, 226, 236, 0.8);
+    background: rgba(255, 255, 255, 0.40); border-color: {c["divider"]};
 }}
 QCheckBox::indicator:checked:disabled {{
-    background: rgba(198, 207, 221, 0.85); border-color: rgba(198, 207, 221, 0.85);
+    background: {c["accentSoftBorder"]}; border-color: {c["accentSoftBorder"]};
 }}
-QTreeWidget, QListWidget {{
+
+/* ---------------------------------------------------------------- 列表 */
+QTreeWidget, QListWidget {{ background: transparent; border: none; outline: none; }}
+QTreeWidget::item {{ margin: 2px 2px; padding: 7px 6px; border-radius: {r["control"]}px; }}
+QTreeWidget::item:hover {{ background: {c["hover"]}; }}
+QTreeWidget::item:selected {{ background: {c["selected"]}; color: {c["accent"]}; }}
+QListWidget::item {{ margin: 2px 2px; padding: 5px 6px; border-radius: {r["control"]}px; }}
+QListWidget::item:hover {{ background: {c["hover"]}; }}
+QListWidget::item:selected {{ background: {c["selected"]}; }}
+QListWidget#homeList {{ background: transparent; }}
+QListWidget#homeList::item {{ margin: 2px 2px; padding: 7px 6px; border-radius: {r["control"]}px; }}
+QListWidget#settingsNav {{
     background: transparent;
     border: none;
-    outline: none;
 }}
-QTreeWidget::item {{ margin: 3px 2px; padding: 7px 4px; border-radius: 7px; }}
-QTreeWidget::item:hover {{ background: rgba(244, 247, 253, 0.70); }}
-QTreeWidget::item:selected {{ background: rgba(234, 241, 255, 0.82); color: {TEXT}; }}
-QListWidget::item {{ margin: 4px 3px; padding: 4px 4px; border-radius: 8px; }}
-QListWidget::item:hover {{ background: rgba(244, 247, 253, 0.70); }}
-QListWidget::item:selected {{ background: rgba(234, 241, 255, 0.82); }}
+QListWidget#settingsNav::item {{
+    padding: 8px 10px;
+    border-radius: {r["control"]}px;
+    color: {c["textMuted"]};
+}}
+QListWidget#settingsNav::item:hover {{ background: {c["hover"]}; color: {c["text"]}; }}
+QListWidget#settingsNav::item:selected {{
+    background: {c["selectedStrong"]};
+    color: {c["accent"]};
+    font-weight: 600;
+}}
 QHeaderView::section {{
     background: transparent;
-    color: {MUTED};
+    color: {c["textMuted"]};
     border: none;
-    border-bottom: 1px solid {BORDER};
+    border-bottom: 1px solid {c["divider"]};
     padding: 6px 4px;
-    font-size: 8.5pt;
+    {_font_pt("caption")}
 }}
+
+/* ---------------------------------------------------------------- 反馈 */
 QProgressBar {{
-    background: rgba(232, 237, 246, 0.62);
+    background: rgba(58, 118, 232, 0.14);
     border: none;
     border-radius: 3px;
     height: 6px;
     text-align: center;
-    font-size: 8pt;
+    font-size: 1pt;
     color: transparent;
 }}
-QProgressBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
-QSlider::groove:horizontal {{ height: 4px; background: rgba(227, 233, 242, 0.75); border-radius: 2px; }}
-QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+QProgressBar::chunk {{ background: {c["accent"]}; border-radius: 3px; }}
+QSlider::groove:horizontal {{ height: 4px; background: rgba(58, 118, 232, 0.16); border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {c["accent"]}; border-radius: 2px; }}
 QSlider::handle:horizontal {{
     width: 16px; height: 16px; margin: -6px 0; border-radius: 8px;
-    background: rgba(255, 255, 255, 0.92); border: 2px solid {ACCENT};
+    /* 手柄半透明：叠在玻璃卡片上能透出底色，描边保证可点击区域清晰 */
+    background: rgba(255, 255, 255, 0.88); border: 2px solid {c["accent"]};
 }}
+QSlider::handle:horizontal:hover {{ border-color: {c["accentHover"]}; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: rgba(201, 210, 225, 0.85); border-radius: 5px; min-height: 28px; }}
-QScrollBar::handle:vertical:hover {{ background: rgba(174, 186, 205, 0.9); }}
+QScrollBar::handle:vertical {{ background: {c["borderStrong"]}; border-radius: 5px; min-height: 28px; }}
+QScrollBar::handle:vertical:hover {{ background: {c["textFaint"]}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-QScrollBar::handle:horizontal {{ background: rgba(201, 210, 225, 0.85); border-radius: 5px; min-width: 28px; }}
+QScrollBar::handle:horizontal {{ background: {c["borderStrong"]}; border-radius: 5px; min-width: 28px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
-QPlainTextEdit {{ background: #0F1520; color: #D6E2F5; border-radius: 10px; padding: 8px; }}
+QPlainTextEdit {{
+    font-family: {FONT_MONO};
+    background: #0F1520;
+    color: #D6E2F5;
+    border-radius: {r["card"]}px;
+    padding: 8px;
+}}
 QMenu {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px; padding: 6px;
+    /* 菜单是独立顶层窗口：不透明白底才能保证文字可读（透明会让下层内容透进来），
+       但用轻微的半透明 + 描边保留玻璃观感 */
+    background: rgba(255, 255, 255, 0.94);
+    border: 1px solid {c["border"]};
+    border-radius: {r["control"]}px;
+    padding: 6px;
 }}
 QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 6px; }}
-QMenu::item:selected {{ background: {ACCENT_SOFT}; }}
+QMenu::item:selected {{ background: {c["selected"]}; color: {c["accent"]}; }}
+QMenu::separator {{ height: 1px; background: {c["divider"]}; margin: 4px 8px; }}
 QToolTip {{
-    background: #1F2530; color: #FFFFFF; border: none; border-radius: 6px; padding: 5px 8px;
+    background: #1F2530; color: #FFFFFF; border: none;
+    border-radius: 6px; padding: 5px 8px;
 }}
+/* 内联样式仍然用到的少量语义类（优先改为 role 属性，这里只作兜底） */
+QLabel#caption {{ color: {c["textMuted"]}; font-size: {TYPE["caption"][0]}pt; }}
+QLabel#emptyTitle {{ {_font_pt("bodyStrong")} color: {c["text"]}; }}
+QLabel#emptyHint {{ {_font_pt("caption")} color: {c["textMuted"]}; }}
+QFrame#divider {{ background: {c["divider"]}; border: none; max-height: 1px; }}
 """
 
 
-#: 原版 PCL2 配色（取自 PCL2 仓库 Application.xaml 的 ColorBrush / ColorBrushGray 色表）
-PCL_TEXT = "#343D4A"
-PCL_ACCENT_DARK = "#0B5BCB"
-PCL_ACCENT = "#1370F3"
-PCL_ACCENT_HOVER = "#4890F5"
-PCL_ACCENT_LIGHT = "#96C0F9"
-PCL_SOFT = "#D5E6FD"
-PCL_SOFT2 = "#E0EAFD"
-PCL_BG = "#EAF2FE"
-PCL_GRAY1 = "#404040"
-PCL_GRAY2 = "#737373"
-PCL_GRAY3 = "#8C8C8C"
-PCL_GRAY4 = "#A6A6A6"
-PCL_GRAY5 = "#CCCCCC"
-PCL_GRAY6 = "#EBEBEB"
-PCL_GRAY7 = "#F0F0F0"
-PCL_GRAY8 = "#F5F5F5"
-PCL_RED = "#FF4C4C"
-PCL_RED_DARK = "#CE2111"
-
-#: 原版 PCL 的窗口背景渐变（上白下浅蓝）
-PCL_BACKGROUND = (
-    (0.0, "#FFFFFF"),
-    (0.55, "#F3F8FF"),
-    (1.0, PCL_BG),
-)
-
-
 def pcl_qss() -> str:
-    """复刻原版 PCL2 的界面样式，追加在 :func:`app_qss` 之后覆盖配色。
+    """原版 PCL2 风格的结构性差异（配色已由 ``TOKENS_PCL`` 覆盖）。
 
-    只覆盖颜色/圆角/边框，布局与控件结构保持不变：白底卡片、浅蓝描边、
-    近乎方角的按钮（radius 3）与 PCL 蓝强调色 ``#1370F3``。
+    历史上这里重复了 340 行选择器只为了换颜色；现在颜色/圆角都由 token 提供，
+    只剩「标题栏是纯蓝实色、启动按钮是描边款」这类结构差异。
     """
-    check = _qss_icon("check", "#FFFFFF", 16)
-    check_icon = f"image: url({check});" if check else ""
-    arrow_down = _qss_icon("chevron-down", PCL_TEXT, 14)
-    down_arrow = (
-        f"QComboBox::down-arrow {{ image: url({arrow_down}); width: 13px; height: 13px; }}"
-        if arrow_down
-        else ""
-    )
+    c = TOKENS_PCL["color"]
     return f"""
-QWidget {{ color: {PCL_TEXT}; }}
-/* 主窗口背景由 Backdrop 绘制，这里必须透明 */
-QMainWindow {{ background: transparent; }}
-QDialog {{
-    background: qlineargradient(x1:0, y1:0, x2:0.35, y2:1,
-        stop:0 #FFFFFF, stop:0.55 #F3F8FF, stop:1 {PCL_BG});
-}}
-QFrame#topbar {{
-    background: #FFFFFF;
-    border-bottom: 1px solid {PCL_SOFT};
-}}
-QFrame#sidebar {{
-    background: #FFFFFF;
-    border-right: 1px solid {PCL_SOFT};
-}}
-QFrame#card {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 6px;
-}}
-QFrame#softCard, QFrame#tile {{
-    background: {PCL_GRAY8};
-    border: 1px solid {PCL_SOFT};
-    border-radius: 6px;
-}}
-QFrame#tile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
-QFrame#installHead {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 6px;
-}}
-QFrame#loaderRow {{
-    background: {PCL_GRAY8};
-    border: 1px solid {PCL_SOFT};
-    border-radius: 6px;
-}}
-QFrame#loaderRow:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
-QFrame#loaderRow[picked="true"] {{
-    background: {PCL_SOFT};
-    border: 2px solid {PCL_ACCENT};
-}}
-QFrame#loaderRow[dimmed="true"] {{
-    background: {PCL_GRAY7};
-    border-color: {PCL_GRAY6};
-}}
-QLabel#dimTitle {{ color: {PCL_GRAY4}; }}
-QLabel#dimText {{ color: {PCL_GRAY4}; }}
-QLabel#pageTitle {{ color: {PCL_TEXT}; }}
-QPushButton#quickTile {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 3px;
-    color: {PCL_TEXT};
-}}
-QPushButton#quickTile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
-QPushButton#quickTile:checked {{
-    background: {PCL_SOFT};
-    color: {PCL_ACCENT_DARK};
-}}
-QLabel#muted {{ color: {PCL_GRAY2}; }}
-QLabel#mutedSmall {{ color: {PCL_GRAY3}; }}
-QLabel#status {{ color: {PCL_GRAY2}; }}
-QLabel#versionTag {{ color: {PCL_GRAY3}; }}
-QLabel#link {{ color: {PCL_ACCENT}; }}
-QLabel#stepBadge {{
-    background: {PCL_BG};
-    color: {PCL_GRAY1};
-    border-radius: 3px;
-}}
-QPushButton {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 3px;
-    padding: 7px 14px;
-    color: {PCL_TEXT};
-}}
-QPushButton:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
-QPushButton:pressed {{
-    background: {PCL_SOFT};
-    border-color: {PCL_ACCENT};
-    padding: 7px 14px;
-}}
-QPushButton:disabled {{
-    background: {PCL_GRAY8};
-    border-color: {PCL_GRAY6};
-    color: {PCL_GRAY4};
-}}
-QPushButton#nav {{
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-    color: {PCL_GRAY1};
-}}
-QPushButton#nav:hover {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
-QPushButton#nav:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
-QPushButton#topnav {{
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-    color: {PCL_GRAY1};
-}}
-QPushButton#topnav:hover {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
-QPushButton#topnav:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
-QPushButton#accent {{
-    background: {PCL_ACCENT};
-    border: 1px solid {PCL_ACCENT};
-    border-radius: 3px;
-    color: #FFFFFF;
-    padding: 7px 14px;
-}}
-QPushButton#accent:hover {{ background: {PCL_ACCENT_HOVER}; border-color: {PCL_ACCENT_HOVER}; }}
-QPushButton#accent:pressed {{ background: {PCL_ACCENT_DARK}; border-color: {PCL_ACCENT_DARK}; padding: 7px 14px; }}
-QPushButton#accent:disabled {{ background: {PCL_ACCENT_LIGHT}; border-color: {PCL_ACCENT_LIGHT}; color: #FFFFFF; }}
-QPushButton#accentBig {{
-    background: {PCL_ACCENT};
-    border: 1px solid {PCL_ACCENT};
-    border-radius: 3px;
-    color: #FFFFFF;
-}}
-QPushButton#accentBig:hover {{ background: {PCL_ACCENT_HOVER}; border-color: {PCL_ACCENT_HOVER}; }}
-QPushButton#accentBig:pressed {{ background: {PCL_ACCENT_DARK}; border-color: {PCL_ACCENT_DARK}; }}
-QPushButton#accentBig:disabled {{ background: {PCL_ACCENT_LIGHT}; border-color: {PCL_ACCENT_LIGHT}; color: #FFFFFF; }}
-QPushButton#danger {{ color: {PCL_RED}; border-color: #F6C6C6; background: #FFFFFF; }}
-QPushButton#danger:hover {{ background: #FBEFEF; border-color: {PCL_RED}; }}
-QPushButton#segment {{
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-    color: {PCL_GRAY2};
-}}
-QPushButton#segment:hover {{ background: {PCL_BG}; color: {PCL_TEXT}; }}
-QPushButton#segment:checked {{ background: {PCL_SOFT}; color: {PCL_ACCENT_DARK}; }}
-QPushButton#tile {{
-    background: {PCL_GRAY8};
-    border: 1px solid {PCL_SOFT};
-    border-radius: 6px;
-    color: {PCL_TEXT};
-}}
-QPushButton#tile:hover {{ background: {PCL_BG}; border-color: {PCL_ACCENT_LIGHT}; }}
-QPushButton#iconBtn, QPushButton#winBtn, QPushButton#winClose {{
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-}}
-QPushButton#iconBtn:hover, QPushButton#winBtn:hover {{ background: {PCL_BG}; }}
-QPushButton#iconBtn:pressed, QPushButton#winBtn:pressed {{ background: {PCL_SOFT}; }}
-QPushButton#winClose:hover {{ background: #FBDDDD; }}
-QPushButton#winClose:pressed {{ background: #F6C6C6; }}
-QPushButton#heroMenu {{ color: {PCL_GRAY2}; border-radius: 3px; }}
-QPushButton#heroMenu:hover {{ color: {PCL_ACCENT}; }}
-QComboBox#heroVersion {{ border-radius: 3px; }}
-QLineEdit#heroName:hover {{ background: #FFFFFF; border-color: {PCL_SOFT}; }}
-QLineEdit#heroName:focus {{ background: #FFFFFF; border-color: {PCL_ACCENT}; }}
-QLineEdit, QSpinBox, QComboBox {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 3px;
-}}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {PCL_ACCENT}; }}
-QLineEdit, QSpinBox {{ selection-background-color: {PCL_ACCENT}; }}
-{down_arrow}
-QCheckBox::indicator {{
-    border: 1px solid {PCL_GRAY4};
-    background: #FFFFFF;
-    border-radius: 3px;
-}}
-QCheckBox::indicator:checked {{
-    background: {PCL_ACCENT};
-    border-color: {PCL_ACCENT};
-    {check_icon}
-}}
-QCheckBox::indicator:disabled {{ background: {PCL_GRAY8}; border-color: {PCL_GRAY6}; }}
-QCheckBox::indicator:checked:disabled {{
-    background: {PCL_ACCENT_LIGHT};
-    border-color: {PCL_ACCENT_LIGHT};
-}}
-QListWidget::item:hover, QTreeWidget::item:hover {{ background: {PCL_BG}; }}
-QListWidget::item:selected, QTreeWidget::item:selected {{
-    background: {PCL_SOFT};
-    color: {PCL_ACCENT_DARK};
-}}
-QHeaderView::section {{
-    background: transparent;
-    color: {PCL_GRAY2};
-    border-bottom: 1px solid {PCL_SOFT};
-}}
-QProgressBar {{ background: {PCL_GRAY6}; border-radius: 3px; }}
-QProgressBar::chunk {{ background: {PCL_ACCENT}; border-radius: 3px; }}
-QSlider::groove:horizontal {{ background: {PCL_SOFT}; border-radius: 2px; }}
-QSlider::sub-page:horizontal {{ background: {PCL_ACCENT}; border-radius: 2px; }}
-QSlider::handle:horizontal {{
-    background: #FFFFFF;
-    border: 2px solid {PCL_ACCENT};
-    border-radius: 8px;
-}}
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
-    background: {PCL_GRAY5};
-    border-radius: 3px;
-}}
-QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
-    background: {PCL_GRAY4};
-}}
-QPlainTextEdit {{
-    background: #FFFFFF;
-    color: {PCL_GRAY1};
-    border: 1px solid {PCL_SOFT};
-    border-radius: 3px;
-}}
-QMenu {{
-    background: #FFFFFF;
-    border: 1px solid {PCL_SOFT};
-    border-radius: 4px;
-}}
-QMenu::item:selected {{ background: {PCL_BG}; color: {PCL_ACCENT_DARK}; }}
-QToolTip {{
-    background: #FFFFFF;
-    color: {PCL_TEXT};
-    border: 1px solid {PCL_SOFT};
-    border-radius: 3px;
-    padding: 5px 8px;
-}}
-/* 标题栏：FormMain.xaml PanTitle（ColorObject4 #4890F5，48px） */
 QFrame#pclTopbar {{
-    background: #4890F5;
+    background: {c["accentHover"]};
     border: none;
 }}
-QLabel#pclBrand {{
-    color: #FFFFFF;
-    font-size: 12pt;
-    font-weight: 700;
-}}
-QLabel#pclPageTitle {{
-    color: {PCL_BG};
-    font-size: 11pt;
-}}
+QLabel#pclBrand {{ color: #FFFFFF; {_font_pt("h3")} }}
+QLabel#pclPageTitle {{ color: {c["accentSoft"]}; {_font_pt("body")} }}
 QLabel#pclStatus {{ color: #FFFFFF; }}
 QPushButton#pclTopnav {{
     background: transparent;
     border: none;
-    border-radius: 13px;
+    border-radius: {RADIUS["pill"]}px;
     color: #FFFFFF;
-    font-size: 9.5pt;
+    {_font_pt("caption")}
     padding: 0 12px;
     min-height: 27px;
     max-height: 27px;
 }}
 QPushButton#pclTopnav:hover {{ background: rgba(234, 242, 254, 0.20); }}
-QPushButton#pclTopnav:checked {{ background: #FFFFFF; color: {PCL_ACCENT}; }}
-QPushButton#pclTitleBtn {{
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-}}
+QPushButton#pclTopnav:checked {{ background: #FFFFFF; color: {c["accent"]}; }}
+QPushButton#pclTitleBtn {{ background: transparent; border: none; padding: 0px; }}
 QPushButton#pclTitleBtn:hover {{ background: rgba(255, 255, 255, 0.18); }}
 QPushButton#pclTitleBtn:pressed {{ background: rgba(255, 255, 255, 0.26); }}
 QFrame#pclTopbar QPushButton#winBtn, QFrame#pclTopbar QPushButton#winClose {{
     background: transparent;
     border: none;
-    border-radius: 3px;
+    padding: 0px;
 }}
 QFrame#pclTopbar QPushButton#winBtn:hover {{ background: rgba(255, 255, 255, 0.18); }}
-QFrame#pclTopbar QPushButton#winBtn:pressed {{ background: rgba(255, 255, 255, 0.26); }}
 QFrame#pclTopbar QPushButton#winClose:hover {{ background: #E81123; }}
-QFrame#pclTopbar QPushButton#winClose:pressed {{ background: #C50F1F; }}
-/* 登录方式胶囊：PageLaunchLeft PanTypeOne（27px 高、13.5px 圆角） */
-/* 启动页左栏：与右侧留白区分（PCL 的 PanLeft 侧栏底色） */
 QFrame#pclLeftPane {{
-    background: rgba(232, 241, 255, 0.78);
-    border-right: 1px solid rgba(208, 226, 250, 0.95);
+    background: {c["accentSoft"]};
+    border-right: 1px solid {c["accentSoftBorder"]};
 }}
-QWidget#pclHomeRight {{
-    background: #FFFFFF;
-}}
+QWidget#pclHomeRight {{ background: {c["surface"]}; }}
 QFrame#pclPill {{
-    background: rgba(234, 242, 254, 0.45);
-    border: 1px solid rgba(213, 230, 253, 0.9);
-    border-radius: 13px;
+    background: {c["surface"]};
+    border: 1px solid {c["accentSoftBorder"]};
+    border-radius: {RADIUS["pill"]}px;
 }}
-QLabel#pclPillText {{
-    color: {PCL_TEXT};
-    font-size: 10.5pt;
-    background: transparent;
-}}
-/* 启动按钮：MyButton Highlight（半透明白底 + #0B5BCB 蓝边蓝字，高 54） */
+QLabel#pclPillText {{ color: {c["text"]}; {_font_pt("body")} }}
 QPushButton#pclLaunch {{
-    background: rgba(255, 255, 255, 0.33);
-    border: 1px solid {PCL_ACCENT_DARK};
-    border-radius: 3px;
-    color: {PCL_ACCENT_DARK};
-    font-size: 10pt;
-    padding-bottom: 15px;
+    background: {c["surface"]};
+    border: 1px solid {c["accentDark"]};
+    border-radius: {RADIUS["control"]}px;
+    color: {c["accentDark"]};
+    {_font_pt("h3")}
+    padding: 4px 8px 18px 8px;
 }}
-QPushButton#pclLaunch:hover {{
-    background: {PCL_SOFT2};
-    border-color: {PCL_ACCENT};
-}}
-QPushButton#pclLaunch:pressed {{ background: {PCL_SOFT}; }}
-QPushButton#pclLaunch:disabled {{
-    border-color: {PCL_GRAY4};
-    color: {PCL_GRAY4};
-}}
+QPushButton#pclLaunch:hover {{ background: {c["accentSoft"]}; border-color: {c["accent"]}; }}
 QLabel#pclLaunchVersion {{
-    color: {PCL_GRAY3};
-    font-size: 8.5pt;
+    color: {c["textMuted"]};
+    font-size: {TYPE["caption"][0]}pt;
     background: transparent;
 }}
-/* 普通按钮：MyButton Normal（1px #343D4A 描边 + 半透明白底） */
 QPushButton#pclSmall {{
-    background: rgba(255, 255, 255, 0.33);
-    border: 1px solid {PCL_TEXT};
-    border-radius: 3px;
-    color: {PCL_TEXT};
+    background: {c["surface"]};
+    border: 1px solid {c["text"]};
+    border-radius: {RADIUS["control"]}px;
+    color: {c["text"]};
     padding: 0 8px;
 }}
-QPushButton#pclSmall:hover {{
-    border-color: {PCL_ACCENT};
-    color: {PCL_ACCENT};
-    background: {PCL_SOFT2};
-}}
-/* 版本下拉与用户名输入：1px 灰边、3px 圆角 */
-QComboBox#pclVersion {{
-    background: rgba(255, 255, 255, 0.92);
-    border: 1px solid {PCL_GRAY5};
-    border-radius: 3px;
+QPushButton#pclSmall:hover {{ border-color: {c["accent"]}; color: {c["accent"]}; }}
+QComboBox#pclVersion, QLineEdit#pclName {{
+    background: {c["surface"]};
+    border: 1px solid {c["border"]};
+    border-radius: {RADIUS["control"]}px;
     padding: 0 8px;
-    color: {PCL_GRAY1};
-    font-size: 9.5pt;
+    color: {c["text"]};
+    {_font_pt("body")}
 }}
-QComboBox#pclVersion:hover {{ border-color: {PCL_ACCENT}; }}
+QComboBox#pclVersion:hover, QLineEdit#pclName:hover {{ border-color: {c["accentSoftBorder"]}; }}
 QComboBox#pclVersion::drop-down {{ border: none; width: 22px; }}
-QLineEdit#pclName {{
-    background: rgba(255, 255, 255, 0.9);
-    border: 1px solid {PCL_GRAY5};
-    border-radius: 3px;
-    padding: 0 8px;
-    color: {PCL_GRAY1};
-    font-size: 9.5pt;
-}}
-QLineEdit#pclName:focus {{ border-color: {PCL_ACCENT}; }}
+QLineEdit#pclName:focus {{ border-color: {c["focus"]}; }}
 """
 
 
 def full_qss(style: str = "default") -> str:
-    """按界面风格返回完整样式表：默认毛玻璃，或叠加 PCL 原版配色。"""
-    return app_qss() + (pcl_qss() if str(style or "").lower() == "pcl" else "")
+    """按界面风格返回完整样式表（``default`` / ``pcl``）。
+
+    结果按风格缓存：``setStyleSheet`` 会重刷窗口里所有控件，重复生成字符串没有意义。
+    """
+    key = "pcl" if str(style or "").lower() == "pcl" else "default"
+    cached = _QSS_CACHE.get(key)
+    if cached is None:
+        cached = app_qss(key) + (pcl_qss() if key == "pcl" else "")
+        _QSS_CACHE[key] = cached
+    return cached

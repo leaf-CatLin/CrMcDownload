@@ -1,8 +1,11 @@
-"""客户端皮肤：本地校验、上传与 CSL mod 安装。
+"""客户端皮肤：本地校验、本地保存与资源包生成（PCL 做法）。
 
-只与 ``download_base`` 通信：皮肤上传走 ``POST {base}/skin/<name>.png``，令牌按
-:class:`~offcraft.net.downloader.Downloader` 的 origin 规则发送；CSL mod 经内容层
-（Modrinth 镜像）自动装进带加载器的实例。任何失败都只记 WARN，绝不阻断启动。
+皮肤**只存本机**（``<数据目录>/skins/``），启动前写成
+``<游戏目录>/resourcepacks/CrMCDownloadSkin/`` 覆盖原版玩家贴图——
+不需要 CustomSkinLoader、不联网、原版实例也能用。
+
+``upload`` 模块里仍保留旧的镜像上传函数（历史数据与测试在用），
+但界面已经不再提供上传入口。
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 from .avatar import head_avatar
 from .csl import CSL_CONFIG_NAME, CSL_JAR_PREFIX, CslStatus, ensure_installed
 from .default import DEFAULT_SKIN_NAME, default_skin_bytes
+from .pack import build_skin_pack, pack_format_for, remove_skin_pack
 from .upload import (
     SkinError,
     SkinInfo,
@@ -26,6 +30,7 @@ __all__ = [
     "CSL_CONFIG_NAME",
     "CSL_JAR_PREFIX",
     "CslStatus",
+    "build_skin_pack",
     "DEFAULT_SKIN_NAME",
     "SkinError",
     "SkinInfo",
@@ -34,9 +39,11 @@ __all__ = [
     "ensure_installed",
     "fetch_skin",
     "head_avatar",
+    "pack_format_for",
     "list_skins",
     "load_local_skin",
     "read_skin",
     "remove_local_skin",
+    "remove_skin_pack",
     "upload_skin",
 ]
