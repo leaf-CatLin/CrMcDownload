@@ -1,4 +1,4 @@
-# 路线图
+﻿# 路线图
 
 | 里程碑 | 内容 | 状态 |
 | --- | --- | --- |
@@ -16,6 +16,7 @@
 | M12 | 安装版本页与内容安装目标（`Target`）、下拉框美化；Issue #1 安全与容量加固（`v0.5.3`） | 已完成 |
 | M13 | Forge/NeoForge 依赖预下载 + `--offline` 安装 + 启动自愈；界面精修 9 项（`v0.5.4`） | 已完成 |
 | M14 | 联机状态探测 + 热度榜、自定义皮肤（CSL + `/skin`）、Web 看板（`/page`）、启动提速、插件雏形（仅官方）（`v0.6.0`） | 已完成 |
+| M15 | UI 重构与性能治理：设计 token 层、入口与图标重构、内容列表改 delegate、渲染/启动/扫描优化 | 已完成 |
 | M10 | 插件市场化（第三方来源 + 动态加载）与外置登录账户服务（LittleSkin / authlib-injector）—— **0.6.x** | 待开始 |
 
 ## 验收基线
@@ -33,8 +34,10 @@
 
 | 仓库 | 命令 | 数量 |
 | --- | --- | --- |
-| `user` | `python -m unittest discover -s tests` | ~420（`test_updater` / `test_microsoft_auth` / `test_theme` 需装 dev 依赖 pytest 与 PyQt6） |
+| `user` | `python -m unittest discover -s tests` | 492（`test_theme` / `test_icons` / `test_content_autoload` / `test_java_autofix` / `test_skin_pack` / `test_ux_features` / `test_updater` / `test_microsoft_auth` 需要 PyQt6，位于 dev 依赖组） |
 | `server` | `python -m pytest tests -q`（或 `unittest discover`） | 206 |
 | `user-downloader` / `user-launcher` / `user-ui` | 同上 | 快照落后于 `user`，未随 0.8.x 同步 |
 
-另有离屏界面自检 `devtools/ui_smoke.py`（断言式）与截图 `devtools/ui_shots.py`。
+另有离屏界面自检 `devtools/ui_smoke.py`（断言式）、性能基准 `devtools/ui_bench.py`
+（p50 对比阈值，作为 UI 回归门禁）与截图 `devtools/ui_shots.py`。
+后两者需要装有 PyQt6 的解释器；`user/.venv` 只有 `cffi / nacl / PIL`，请用系统 Python 运行。

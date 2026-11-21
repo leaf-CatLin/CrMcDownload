@@ -72,6 +72,146 @@ SourceRouter（offcraft/net/latency.py）
 因此内容层、安装管线、加载器安装与 Java 运行时都无需改动；Modrinth 的多个候选域名则用 `rank()`
 按实测时延排序后取第一个。
 
+**只复用「选了哪个源」，不复用具体地址**（2026-11 修复）：`_rewrite_multi` 的路由缓存按 host 聚合
+（所有 `piston-meta` / `launchermeta` 地址共用 `route:meta`），但 `Decision.url` 是当时探测的那**一个**
+具体地址。早期实现直接返回 `Decision.url`，于是先取版本清单之后，同路由的其它文件
+（`java-runtime/all.json`、各个版本 JSON）都会被改写成版本清单地址，表现为「Java 页永远转圈 /
+清单解析失败」。现在按 `Decision.source` 为当前 url 重新挑候选，缓存只承载源的选择。
+
+探测定理同样调整过：`decide_multi` 的网络采样**不再持锁**（旧实现把 2×5s 的采样放在 `with self._lock`
+里，同一时刻其它线程的路由决策全部排队），改为「同 key 只探测一次」的事件门 + 锁内只做缓存读写。
+
+## UI 设计 token 与渲染预算（2026-11）
+
+界面视觉与性能的统一约定，客户端侧见 `user/offcraft/ui/tokens.py`：
+
+- **单一 token 源**：颜色 / 字号 / 圆角 / 间距 / 层级只有 `TOKENS`（默认）与 `TOKENS_PCL`（PCL2 风格）
+  两张表；`theme.app_qss(style)` 只做展开，`pcl_qss()` 仅保留结构差异（标题栏、启动按钮描边款），
+  历史上那份 340 行的 PCL 重复选择器已删除。切风格 = 换 token 表，不再改选择器。
+- **收敛尺度**：字号 8 档、圆角 3 档（control 8 / card 12 / pill 999）、间距 4/8/12/16/24/32/48；
+  `tests/test_theme.py` 断言档数与 WCAG AA 对比度（正文 ≥ 7:1、次要文字 ≥ 4.5:1、卡片/描边与背景 ≥ 1.15:1）。
+- **QSS 不写死颜色**：内联 `setStyleSheet` 从 74 处降到个位数，其余走 `QLabel[role="h2"]` 这类属性选择器
+  （`theme.apply_role(widget, "h2")`），为后续暗色模式留出入口。
+- **渲染预算**（`devtools/ui_bench.py` 断言）：首帧 < 600ms、打开页面 < 400ms、填充 100 行内容列表
+  < 200ms、列表滚动一帧 < 8ms、整窗重绘 < 20ms。
+
+关键实现选择，都是踩过坑之后定下来的：
+
+| 问题 | 做法 |
+| --- | --- |
+| 每行一个 QWidget 的列表（100 行 1.6s、滚动 14ms/帧） | `ContentDelegate(QStyledItemDelegate)` 自绘；图标走 item data + `block_pixmap` 的 `lru_cache` |
+| 每次刷新 `list.clear()` 重建 | `_sync_rows` 按 id 增量增删，顺序不变时只回写数据 |
+| 淡入后 `QGraphicsOpacityEffect` 常驻 | `motion._finish` 里 `setGraphicsEffect(None)` 真正卸载；波纹改为每窗口一个复用层 |
+| 背景渐变每次 `paintEvent` 重建 | `Backdrop` 预渲染成 QPixmap，尺寸变化才重建；GIF 缩放改 `FastTransformation` |
+| 隐藏页面的 `Spinner` 仍 16ms 跑定时器 | `hideEvent` 停表，`showEvent` 按需启（且要求 `isVisible()`） |
+| 版本搜索每敲一个字整表重排 | 180ms 防抖 + `block_pixmap` 缓存（400 个图标 89ms → 2.4ms） |
+| 30 秒定时器在 GUI 线程跑资源审计 | 磁盘审计移到工作线程，结果 `post` 回主线程做差异更新 |
+| 全盘扫描其他 `.minecraft`（冷扫 162s） | `scan_minecraft_dirs` 改为已知候选根 + 深度 3 + 4s 截止 |
+| 设置页每次显示都探测 Java | `list_java_cached`（5 分钟，`refresh=True` 绕过） |
+| 首帧前做 Java 探测 / 清单读盘 / 扫实例 | `QTimer.singleShot(0, _start_background_init)` 推到首帧之后 |
+| 每张内容图标都 new 一个 Downloader（每个建一次 SSL context，枚举系统证书库 21.8ms） | `net/downloader.shared_ssl_context()`：进程级共享一份 SSL 上下文 |
+| 60 张图标 = 60 个线程，GIL 下把主线程饿死（实测 34.3s「未响应」） | 有界 4 线程池 `_icon_pool` + 按线程复用 Downloader |
+| 图标解析触发 `SourceRouter` 时延探测（首次可达 40s） | 图标是装饰性资源，直接 `Mirror.rewrite` 纯字符串改写，不做择优 |
+| 下载页 7 个页签一次性构造 130ms | 先放占位，`_fill_download_tabs()` 逐页签补造，每步让出事件循环 |
+| 页面首次点击才现场构造 | 启动后 `warm_pages()` 依次预热四个一级页面 |
+| 图标等用户翻到才加载 | 启动即按分类（模组/整合包/资源包/光影）各起一条预取线程，按批入池 |
+
+### 响应性契约
+
+界面线程的停顿必须小于 60ms（Windows 的「未响应」判定阈值远高于此，
+但 60ms 是肉眼可感知卡顿的下限）。所有会读盘、联网、起子进程的工作都必须
+满足下面任一条：
+
+1. 在 `warm_pages()` / `_fill_download_tabs()` 这类**分片**流程里执行，
+   每片之间 `QTimer.singleShot(0, ...)` 让出事件循环；或
+2. 放进工作线程，结果通过 `window.post()` 回主线程。
+
+`devtools/ui_smoke.py` 断言「刷新不阻塞主线程」，`devtools/ui_bench.py` 断言
+`show_page` / `apply_result` / 滚动 / 重绘的耗时上限；新增页面或加载路径时
+应同步补一条断言。
+
+### 内容列表的分页节奏
+
+`ContentPage` 有三条加载路径，共用同一个请求互斥（`_requesting` / `_loading_more`），
+同一时刻只会有一个请求在飞：
+
+| 路径 | 触发 | 条数 |
+| --- | --- | --- |
+| 首屏 | 进入页签 / 换筛选 | `PAGE_SIZE` = 60 |
+| 定时自动追加 | 首屏完成后每 `AUTO_LOAD_SECONDS` = 5s | `AUTO_APPEND_SIZE` = 30 |
+| 滚动预取 | 滚动条过已加载内容 50% | 60 |
+
+定时追加是**让位式**的：用户在本轮 5 秒窗口内自己加载过（点「重试」或触发滚动预取），
+`_auto_skip_round` 置位，这一轮自动追加直接跳过，下一轮恢复——避免自动加载和用户
+操作抢同一个请求槽。到底（`offset >= total`）后定时器自动停表；页面 `hideEvent`
+时暂停、`showEvent` 时恢复，不在看不见的页面上空跑网络。
+
+`tests/test_content_autoload.py` 用离屏 Qt + 桩客户端覆盖了这些契约（首屏 60、
+每 5s 补 30、用户加载后跳过一轮、到底停表、暂停恢复），不依赖网络也能在 CI 里跑。
+
+### 空闲门控：30 秒无操作就停止自动加载
+
+后台自动加载（内容列表定时追加、联机页 5 秒刷新）只在「用户真的在用」时跑：
+
+```
+_ActivityFilter(QObject)  装到 QApplication，捕获鼠标/键盘/滚轮/触摸
+        → note_user_activity()  刷新 _last_user_activity（鼠标移动 300ms 节流）
+_sync_idle_gate()         由 5s 巡检定时器 + changeEvent(WindowStateChange) 驱动
+        → loading_allowed() = 窗口可见且未最小化 且 距最后操作 < IDLE_STOP_SECONDS(30s)
+        → 不允许则停 _content_timer / 联机自动刷新 / 内容页定时追加
+```
+
+暂停只在「自动」加载上生效：用户手动点出来的下载任务照常跑完。
+恢复是自动的——任何一次操作都会解除暂停并重启当前页的定时器。
+
+> 注意：`_ActivityFilter` 必须由窗口持有引用（`self._activity_filter`），且在
+> `closeEvent` 里 `removeEventFilter`。否则 Qt 析构时可能回调已释放的窗口，
+> 在进程退出阶段触发访问冲突（0xC0000005，表现为「指标全过但退出码异常」）。
+
+### 资源包内容浏览
+
+双击启动页「已装资源 / 已装光影」里的条目 → `offcraft/ui/pack_view.py:PackBrowser`：
+左侧按路径分层的 `QTreeWidget`，右侧图片预览（等比缩放、可滚动）。`.zip` 用
+`zipfile` 按需读、文件夹直接读，**不解压到磁盘**；单包最多列 `MAX_ENTRIES`(4000) 项、
+单图超过 `MAX_IMAGE_BYTES`(16MiB) 不加载。左右两个面板各套一张 `Card`，
+目录默认展开 `DEFAULT_EXPAND_DEPTH`(3) 层，另有「全部展开 / 全部折叠」。
+
+> 树不继承 QSS 的 `color`，只靠调色板会显得发灰（在 0.62 透明度的卡片上尤其明显）。
+> 因此 `PackBrowser` 对目录名 / 图片名显式设 `TEXT`，非图片文件与「大小」列设 `MUTED`，
+> 并给 `QTreeWidget` / `::item` / `QHeaderView::section` 写局部 QSS 兜底。
+> 不要用 `palette().darker()`——调色板前景本就接近黑，再 darker 反而更难读。
+
+预览控件是自绘的 `_CheckerCanvas`（不是 QLabel），两个要点：
+
+1. **透明区域铺经典灰白棋盘格**（`CELL`=8px，`#FFFFFF` / `#D6D6D6`，QPainter 自绘不用图片资源）。
+   棋盘格只画在图片实际占用的矩形内并裁剪——图片比可视区小时，四周留白不应该也是棋盘格，
+   否则整屏很花。无图/读失败时走 `set_message()`，只显示文字、不画格子。
+2. **小贴图整数倍放大**：资源包常见 16×16 / 32×32，原样显示只有指甲盖大。按可视区做
+   整数倍放大（上限 16 倍）并用**最近邻插值**（`FastTransformation`）保住像素画硬边；
+   平滑插值会把像素画糊成一团。大图仍走等比缩小 + `SmoothTransformation`。
+
+缩放每帧按画布自身 `rect()` 计算（不在加载时算一次），窗口拉伸时图片自适应。
+
+> 写相关测试时注意：`QPixmap.fill()` 不带参数默认填**白色**而非透明，
+> 会盖住棋盘格导致断言失败；构造透明图必须 `fill(Qt.GlobalColor.transparent)`。
+
+### 资源包内部图标
+
+`launch/resources.py:pack_icon_bytes()` 读取资源包根目录的 `pack.png`（游戏内资源包
+列表显示的就是它），`ui/app.py:_resource_icon()` 拿它当启动页列表图标。支持
+zip / 文件夹 / `*.zip.disabled` 三种形态（`.disabled` 只是改了后缀，`zipfile` 按内容
+判断格式，直接打开即可），任何异常静默回退到按文件名生成的占位图。
+
+### 前置依赖检测与光影页签
+
+| 检查 | 位置 | 规则 |
+| --- | --- | --- |
+| 下载前查前置 | `content/install.missing_dependencies` | 只认 `required`；有 `file_name` 精确比对，否则 `project_id` → slug 前缀匹配已装文件 |
+| 有无光影前置 | `launch/resources.has_shader_loader` | `mods/` 里有 `iris-*` / `optifine*` / `oculus-*` 的 `.jar`（`.disabled` 不算） |
+
+缺前置时弹窗列名询问是否一并下载；没有光影前置时「已装光影」页签直接隐藏——
+光影包单独放进 `shaderpacks/` 不会生效，留着是死按钮。
+
 ## 安装管线
 
 ```
@@ -180,18 +320,60 @@ GitHub 及其 CDN 主机；`check_url(url, allow_untrusted=False)` 返回中文�
 更贴切）在独立线程的事件循环里按 `SERVER_PROBE_INTERVAL` 批量探测 `enabled` 服务器，写 `ping_history` 与
 `servers_state`；停止时 `call_soon_threadsafe(loop.stop)` + 线程 join 保证干净退出。探测目标同样过 SSRF 校验。
 
-## 皮肤链路（0.6.0）
+## 皮肤链路（PCL 资源包 + CSL 并存）
+
+上传链路已从界面移除。皮肤**只存本机**，且是**全局单槽**（不做多用户隔离）。
 
 ```
-客户端 offcraft/skins/            服务端 /skin                      游戏内
-  upload.py   Pillow 校验/判型   SkinStore: PNG magic+verify    CSL mod 请求 {base}/skin/%s.png
-  avatar.py   8×8 头像 NEAREST    64×64 / 64×32、64KiB、原子写
-  csl.py      Modrinth 装 CSL + 写 CustomSkinLoader.json
+客户端 offcraft/skins/
+  upload.py   单槽：<数据目录>/skins/local.png（纤细 local_slim.png）
+              save_slot_skin / load_slot_skin / remove_slot_skin
+              Pillow 校验并自动判 classic|slim
+  avatar.py   8×8 头像 NEAREST，供启动页头像
+  pack.py     路径 ①：启动前生成 <游戏目录>/resourcepacks/CrMCDownloadSkin/
+              ├─ pack.mcmeta（pack_format 按 MC 大版本查表）
+              ├─ pack.png（手写最小 PNG，不依赖 Pillow）
+              └─ assets/minecraft/textures/entity/player/{steve,alex,wide/steve}.png
+              → 再写进 options.txt 的 resourcePacks
+  csl.py      路径 ②：带加载器的实例装 CustomSkinLoader，
+              loadlist 首位挂 LocalSkin（读 <数据目录>/skins/<用户名>.png）+ 镜像源
 ```
 
-皮肤走 token-origin 规则：上传（`POST /skin/<name>.png`）带 `X-OffCraft-Token`，读取免令牌。
-`offcraft/account/` 预留 `AccountProvider` 抽象（当前仅 `OfflineAccount`），`command.py` 支持
-`options.java_agent` 拼 `-javaagent=`，后续接 LittleSkin / authlib-injector 只需新增 provider 实现。
+启动前 `_prepare_custom_skin` 依次跑两条路径，**互为兜底**：资源包失败时 CSL 仍能显示皮肤，
+CSL 装不上（原版实例 / 无加载器 / 无下载源）时资源包仍生效。
+
+要点：
+
+- **原版实例也能显示**：资源包覆盖原版玩家贴图，不需要 mod；
+- **CSL 支持本地皮肤**，所以保留：`sync_local_skin_file()` 把单槽复制成 CSL 认识的
+  `<用户名>.png`，`LocalSkin` 类型完全离线；没有下载源时照样写配置，有源时再补装 jar；
+- **三处贴图都写**（经典 / 纤细 / 1.19.2+ 的 `player/wide/`），否则玩家切成纤细模型会退回默认皮肤；
+- `pack_format` 必须匹配游戏版本，否则资源包被标成「不兼容」而不启用，故按大版本查表
+  （1.12→4、1.16→5、1.18→8、1.20→15、1.21→34，未知版本用宽松默认值）；
+- 资源包写到**实例自己**的游戏目录（尊重「版本隔离」），路径由 `instance_game_dir()` 决定；
+- 任何失败只记 WARN，绝不影响启动。
+
+服务端 `/skin` 与 `SkinStore`、以及 `skins/upload.py` 里的镜像上传函数仍保留（历史数据与既有测试在用），
+但客户端界面已无上传入口。`offcraft/account/` 预留 `AccountProvider` 抽象（当前仅 `OfflineAccount`），
+`command.py` 支持 `options.java_agent` 拼 `-javaagent=`，后续接 LittleSkin / authlib-injector 只需新增 provider 实现。
+
+## 缺 Java 自愈（0.9.0）
+
+```
+launch_game → build_command
+   └─ LaunchError 且文案命中「需要 Java / 没有找到可用的 Java / 未检测到 Java」
+        → 投递 ("java_missing", (实例 id, 所需主版本, 原文))
+        → QMessageBox 询问「是否现在自动下载并安装 Mojang 官方运行时」
+        → 是：读 java-runtime/all.json → pick_runtime_for_major() 挑组件
+             → install_java_runtime() 展开到 runtime/<component>/
+             → 写 java_overrides["__global__"] → 自动重试启动同一实例
+        → 否：提示「需要 Java N 才能启动」，不做任何改动
+```
+
+`pick_runtime_for_major` 的选择规则：精确同主版本优先 → 否则取**更高的最小**版本
+（需要 19 就装 21，不要装 17 或 8）→ 清单里全都更低时兜底最高可用版本；
+版本没声明 `javaVersion` 时优先 Java 8。识别条件只看那三种文案，避免把「缺依赖文件」
+误判成缺 Java——两组断言分别在 `tests/test_java_autofix.py`。
 
 ## 服务端 API 与热度数据库（0.6.0）
 

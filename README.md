@@ -1,4 +1,4 @@
-# CrMCDownload
+﻿# CrMCDownload
 
 自建镜像 + 离线账户的 Minecraft 启动器。客户端（PyQt6，PCL 风格）从你的镜像服务器下载原版版本、模组、整合包、资源包与光影，
 服务端代理 Mojang / Fabric / Modrinth 文件并做磁盘缓存。
@@ -186,7 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build_installer.ps
 #         启动的进程写不了 C 盘，安装器会直接弹框说明而不是静默失败
 ```
 
-当前版本：`0.8.5`（`user`、`user-*` 分支）；服务端 `0.7.0`。
+当前版本：`0.9.1`（`user`、`user-*` 分支）；服务端 `0.7.0`。
 
 配置默认在 `%APPDATA%\CrMCDownload\config.json`。
 
