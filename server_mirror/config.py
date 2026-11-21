@@ -1,10 +1,11 @@
-﻿"""服务端配置：全部来自环境变量，便于 systemd / Docker 注入。"""
+"""服务端配置：全部来自环境变量，便于 systemd / Docker 注入。"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 __all__ = ["Settings", "load_env_file"]
 
@@ -145,11 +146,29 @@ class Settings:
     plugin_dir: Path = DEFAULT_DATA_ROOT / "plugins"
     #: 更新配置：GitHub 仓库、最新/最低版本、是否强制、发布页与安装包文件名
     update_repo: str = "leaf-CatLin/CrMcDownload"
+    #: 兜底版本号：仅当 GitHub 不可达且没有快照文件时使用。
+    #: 正常部署下最新版本由 GitHub Releases 自动检测（见 ``releases_provider``）。
     update_latest: str = "0.9.1"
+    #: 最低版本：空 = 不启用门槛；``auto`` = 自动取当前次版本的上一档；
+    #: 其它值 = 显式写死（如 ``0.8.5``）
     update_min: str = ""          # 空 = 不强制更新
     update_enforce: bool = True
     update_release_url: str = ""  # 空 = 按仓库 + tag 拼 GitHub Releases 页面
-    update_asset: str = ""        # 空 = CrMCDownload-<version>-win64-setup.exe
+    update_asset: str = ""        # 空 = 按 GitHub 资产挑安装包（setup / install）
+    #: 版本自动检测：从 GitHub Releases 拉取最新版本并在服务端缓存
+    update_auto: bool = True
+    #: 快照新鲜期（秒）：过期后下次请求会回源刷新（失败则继续用旧快照）
+    update_cache_ttl: int = 600
+    #: 快照文件路径（空 = ``<data_root>/releases.json``），重启后立即可用
+    update_cache_file: Path = Path("")
+    #: 检测 GitHub 时的超时（秒）
+    update_timeout: float = 8.0
+    #: 可选的 GitHub Token（提高 API 额度；只读公开仓库不需要）
+    update_github_token: str = ""
+    #: 是否把 GitHub 上的预发布版也当作最新版本
+    update_include_prerelease: bool = False
+    #: 运行期注入的版本快照来源（main 里构造 ``releases.ReleaseProvider`` 后挂上）
+    releases_provider: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -202,18 +221,62 @@ class Settings:
                             not in ("0", "false", "no", "off")),
             update_release_url=(env.get("MIRROR_UPDATE_RELEASE_URL") or "").strip(),
             update_asset=(env.get("MIRROR_UPDATE_ASSET") or "").strip(),
+            update_auto=(env.get("MIRROR_UPDATE_AUTO", "on").strip().lower()
+                         not in ("0", "false", "no", "off")),
+            update_cache_ttl=max(0, _int(env, "MIRROR_UPDATE_CACHE_TTL", 600)),
+            update_cache_file=Path(
+                env.get("MIRROR_UPDATE_CACHE_FILE") or root / "releases.json"
+            ),
+            update_timeout=max(1.0, _float(env, "MIRROR_UPDATE_TIMEOUT", 8.0)),
+            update_github_token=(env.get("MIRROR_UPDATE_GITHUB_TOKEN")
+                                 or env.get("GITHUB_TOKEN") or "").strip(),
+            update_include_prerelease=(env.get("MIRROR_UPDATE_INCLUDE_PRERELEASE", "").strip().lower()
+                                       in ("1", "true", "yes", "on")),
         )
 
     def prepare(self) -> None:
-        """创建持久数据目录（数据库 / 皮肤 / 插件 / 热门种子），幂等。"""
-        for directory in (
+        """创建持久数据目录（数据库 / 皮肤 / 插件 / 热门种子 / 版本快照），幂等。"""
+        directories = [
             self.data_root,
             self.db_path.parent,
             self.popular_data.parent,
             self.skins_dir,
             self.plugin_dir,
-        ):
+        ]
+        if str(self.update_cache_file):
+            directories.append(self.update_cache_file.parent)
+        for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------- 版本自动检测
+    def build_releases(self):
+        """按当前配置构造版本检测器：最新版本来自 GitHub Releases（自动 + 缓存）。
+
+        ``MIRROR_UPDATE_LATEST_VERSION`` 退化为兜底值（``update_latest``）；
+        ``MIRROR_UPDATE_AUTO=off`` 时完全不联网，只用快照文件 / 兜底值。
+        """
+        from server_mirror.releases import ReleaseProvider
+
+        cache_file = self.update_cache_file
+        if not str(cache_file):
+            cache_file = self.data_root / "releases.json"
+        min_mode = self.update_min if self.update_min.strip().lower() == "auto" else "off"
+        explicit_min = "" if min_mode == "auto" else self.update_min
+        return ReleaseProvider(
+            repo=self.update_repo,
+            cache_file=cache_file,
+            ttl=self.update_cache_ttl,
+            timeout=self.update_timeout,
+            proxy=self.proxy,
+            token=self.update_github_token,
+            fallback_version=self.update_latest,
+            fallback_min=explicit_min,
+            min_mode=min_mode,
+            offline=not self.update_auto,
+            include_prerelease=self.update_include_prerelease,
+            asset_hint=self.update_asset,
+            release_url=self.update_release_url,
+        )
 
     @property
     def host(self) -> str:

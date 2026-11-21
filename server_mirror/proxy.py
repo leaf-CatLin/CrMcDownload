@@ -181,8 +181,12 @@ class MirrorHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "forbidden"})
             return
         # 版本门槛：低于最低版本的客户端直接 426（缺版本头的请求放行）
+        # 用同一个版本快照，避免每次代理请求都去问 GitHub
         blocked = version_gate(
-            self.server.settings, dict(self.headers.items()), self.path.partition("?")[2]
+            self.server.settings,
+            dict(self.headers.items()),
+            self.path.partition("?")[2],
+            snapshot=_cached_snapshot(self.server.settings),
         )
         if blocked is not None:
             status, headers, body = blocked
@@ -497,6 +501,21 @@ def _as_int(value: str | None) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _cached_snapshot(settings) -> object | None:
+    """取版本快照给版本门槛用；没有检测器时返回 ``None``（回落 ``.env`` 配置）。
+
+    这里只读内存快照、不触发回源：代理路由是热路径，不能因为版本检测把
+    下载请求拖慢，刷新交给后台线程与 ``/api/*`` 的请求驱动。
+    """
+    provider = getattr(settings, "releases_provider", None)
+    if provider is None:
+        return None
+    try:
+        return provider.snapshot()
+    except Exception:  # noqa: BLE001 - 版本检测异常按「没有快照」处理
+        return None
 
 
 def _path_of(url: str) -> str:

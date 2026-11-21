@@ -24,7 +24,13 @@ from server_mirror.db import Database
 from server_mirror.default_skin import DEFAULT_SKIN_NAME, default_skin_bytes
 from server_mirror.skins import SkinError, SkinStore
 from server_mirror.ssrf_guard import ServerAddressError, parse_host_port
-from server_mirror.update import request_version, update_info, version_gate
+from server_mirror.update import (
+    releases_payload,
+    request_version,
+    update_info,
+    version_gate,
+)
+from server_mirror.versions import normalize
 
 __all__ = ["ApiRouter"]
 
@@ -107,8 +113,12 @@ class ApiRouter:
         return self.page.serve(path)
 
     def _serve_update(self):
-        """``GET /update`` → 301 跳到 GitHub Releases 页面（下载按钮统一入口）。"""
-        info = update_info(self.settings)
+        """``GET /update`` → 301 跳到 GitHub Releases 页面（下载按钮统一入口）。
+
+        目标 tag 来自自动检测到的发布（``releases_provider``），因此发新版本后
+        这里自动跟着走，不需要改配置。
+        """
+        info = update_info(self.settings, snapshot=self._snapshot())
         return 301, {
             "Location": info.page_url,
             "Cache-Control": "no-store",
@@ -173,8 +183,11 @@ class ApiRouter:
         if path == "/api/update":
             # 更新查询本身永远放行，老客户端靠它拿到强制更新信息
             return self._update(params, headers)
+        if path == "/api/releases":
+            # 更新历史（GitHub Releases 自动检测的结果），官网更新日志也读它
+            return self._releases(params)
         query = "&".join(f"{k}={v}" for k, v in params.items())
-        blocked = version_gate(self.settings, headers, query)
+        blocked = version_gate(self.settings, headers, query, snapshot=self._snapshot())
         if blocked is not None:
             return blocked
         if path == "/api/servers/list":
@@ -196,12 +209,54 @@ class ApiRouter:
             return self._stats(path.rsplit("/", 1)[1])
         return _err(404, "未知接口")
 
+    def _release_provider(self):
+        """当前版本检测器（``Settings.build_releases`` 注入，缺省为 ``None``）。"""
+        provider = getattr(self.settings, "releases_provider", None)
+        if provider is not None:
+            return provider
+        builder = getattr(self.settings, "build_releases", None)
+        if builder is None:
+            return None
+        try:
+            provider = builder()
+        except Exception:  # noqa: BLE001 - 构造失败当作没有自动检测
+            return None
+        try:
+            self.settings.releases_provider = provider
+        except AttributeError:
+            pass
+        return provider
+
+    def _snapshot(self):
+        """取一次（可能触发回源的）版本快照，供各版本接口复用。"""
+        provider = self._release_provider()
+        if provider is None:
+            return None
+        try:
+            return provider.current()
+        except Exception:  # noqa: BLE001 - 版本检测异常不能拖垮接口
+            return provider.snapshot()
+
     def _update(self, params: dict[str, str], headers: dict[str, str]):
-        """``GET /api/update``：返回最新/最低版本、强制更新标记与下载地址。"""
-        info = update_info(self.settings)
-        client = request_version(headers) or str(params.get("v") or params.get("version") or "")
-        client = client.strip().lstrip("vV")[:32]
+        """``GET /api/update``：返回最新/最低版本、强制更新标记与下载地址。
+
+        最新版本来自 GitHub Releases 自动检测（服务端缓存），不再是 ``.env`` 常量。
+        """
+        info = update_info(self.settings, snapshot=self._snapshot())
+        client = request_version(headers) or normalize(params.get("v") or params.get("version") or "")
         return _json(200, info.payload(client), extra_headers={"Cache-Control": "no-store"})
+
+    def _releases(self, params: dict[str, str]):
+        """``GET /api/releases``：更新日志（GitHub Releases）+ 当前版本与检测状态。"""
+        limit = _clamp(params.get("limit"), 1, 20, 5)
+        snapshot = self._snapshot()
+        payload = releases_payload(
+            self.settings,
+            provider=self._release_provider(),
+            limit=limit,
+            snapshot=snapshot,
+        )
+        return _json(200, payload, extra_headers=_READ_CACHE)
 
     def _list(self, params: dict[str, str]):
         q = str(params.get("q") or "")[:64]

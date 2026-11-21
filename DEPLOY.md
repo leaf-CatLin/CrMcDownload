@@ -113,44 +113,66 @@ curl -s -o /dev/null -w '%{http_code}\n' "https://mc.yjlt.top/forgemaven/net/min
 | `https://mc.yjlt.top/page/` | 官网（项目介绍 / 下载 / 更新日志 / 关于） |
 | `https://mc.yjlt.top/page/status` | 运维看板（概览 / 缓存 / 下载热度 / 联机 / 皮肤） |
 
-更新相关的三个入口：
+更新相关的入口：
 
 | 地址 | 行为 |
 | --- | --- |
-| `GET /update` | **301** → GitHub Releases 页面（浏览器里点“下载最新版”就是这个） |
-| `GET /api/update` | 返回 `latest_version` / `min_version` / `force_update` / 直连与镜像下载地址 |
+| `GET /update` | **301** → GitHub Releases 页面（tag 来自自动检测，发版即跟随） |
+| `GET /api/update` | 返回 `latest_version` / `min_version` / `force_update` / 直连与镜像下载地址 / 全部资产 |
+| `GET /api/releases` | 更新历史（GitHub Releases 自动检测 + 缓存），官网「更新日志」页读它 |
 | `GET /github/<owner>/<repo>/releases/download/<tag>/<file>` | 安装包镜像代理，透传 `Range`，支持断点续传 |
 
-`.env` 里与版本有关的配置：
+### 最新版本自动检测（0.8.0 起）
+
+**发布新客户端不需要再改 `.env`、也不需要重启服务**：服务端直接读
+`https://api.github.com/repos/<MIRROR_UPDATE_REPO>/releases`，取最新的非预发布、非 draft 版本，
+连 tag、发布页、资产名与更新日志正文一起缓存。
 
 ```bash
-MIRROR_UPDATE_REPO=crazying-dev/CrMcDownload
-MIRROR_UPDATE_LATEST_VERSION=0.7.0
-MIRROR_UPDATE_MIN_VERSION=0.7.0   # 客户端低于此版本时 API / 下载返回 426
+MIRROR_UPDATE_REPO=leaf-CatLin/CrMcDownload
+MIRROR_UPDATE_AUTO=on             # off = 完全不联网，只用快照文件与兜底值
+MIRROR_UPDATE_CACHE_TTL=600       # 快照新鲜期（秒）
+# MIRROR_UPDATE_CACHE_FILE=../db/CrMcDownload/releases.json
+# MIRROR_UPDATE_TIMEOUT=8
+# MIRROR_UPDATE_GITHUB_TOKEN=ghp_xxx   # 可选，只提高 API 额度（60 → 5000 次/小时）
+MIRROR_UPDATE_MIN_VERSION=auto    # 空 = 不设门槛；auto = 当前次版本的上一档（0.9.1 → 0.8.0）
 MIRROR_UPDATE_ENFORCE=on
-# MIRROR_UPDATE_ASSET=CrMCDownload-{version}-win64-setup.exe
+# 兜底版本号：仅 GitHub 不可达且没有快照文件时使用，正常不用维护
+MIRROR_UPDATE_LATEST_VERSION=0.9.1
 ```
+
+缓存行为（都不用运维干预）：
+
+- 快照在 `MIRROR_UPDATE_CACHE_TTL` 内直接命中内存；过期后由第一个请求（或后台线程）
+  带 `ETag` 条件请求回源，304 也算一次成功刷新，**其余请求继续用旧快照，不阻塞**；
+- GitHub 不可达时按 30s → 60s → … → 30min 指数退避重试，旧快照照常对外服务；
+- 快照落在 `<MIRROR_DATA_DIR>/releases.json`，重启后立刻可用，不用等首次检测；
+- 想立刻验证刚发的版本，删掉快照文件再打一次 `/api/update` 即可（或等 TTL 到期）。
 
 自检：
 
 ```bash
-curl -sI https://mc.yjlt.top/update | head -n 3            # 301 + Location: .../releases/tag/v0.7.0
-curl -s https://mc.yjlt.top/api/update | python -m json.tool
-curl -s -o /dev/null -w '%{http_code}\n' -H 'X-OffCraft-Version: 0.6.2' https://mc.yjlt.top/api/stats/overview   # 426
-curl -s -o /dev/null -w '%{http_code}\n' -H 'X-OffCraft-Version: 0.7.0' https://mc.yjlt.top/api/stats/overview   # 200
-curl -s -o /dev/null -w '%{http_code}\n' -r 0-1023 https://mc.yjlt.top/github/crazying-dev/CrMcDownload/releases/download/v0.7.0/CrMCDownload-0.7.0-win64-setup.exe   # 206
+curl -sI https://mc.yjlt.top/update | head -n 5           # 301 + Location: .../releases/tag/v0.9.1（自动跟随最新 tag）
+curl -s https://mc.yjlt.top/api/update | python -m json.tool        # latest_version / version_source / version_checked_at
+curl -s 'https://mc.yjlt.top/api/releases?limit=5' | python -m json.tool   # 更新历史 + check.source / check.stale
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-OffCraft-Version: 0.8.0' https://mc.yjlt.top/api/stats/overview   # 426（门槛 0.9.1）
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-OffCraft-Version: 0.9.1' https://mc.yjlt.top/api/stats/overview   # 200
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-1023 https://mc.yjlt.top/github/leaf-CatLin/CrMcDownload/releases/download/v0.9.1/CrMCDownload-0.9.1-win64-setup.exe   # 206
 ```
 
-> 建议先把 `MIRROR_UPDATE_MIN_VERSION` 留空跑一轮，确认 `/api/update` 与镜像下载正常后再抬高到 `0.7.0`，
+> 建议先把 `MIRROR_UPDATE_MIN_VERSION` 留空跑一轮，确认 `/api/update` 与镜像下载正常后再设为 `auto`，
 > 避免发布资产尚未上传时把所有人都挡在 426 上。
 
-## 5.3 0.7.0 上线步骤
+## 5.3 发布新版本的上线步骤
 
 1. 客户端打包：`pyinstaller CrMCDownload.spec --noconfirm --clean` → `packaging\build_installer.ps1`；
-2. GitHub 建 tag `v0.7.0`，上传资产 `CrMCDownload-0.7.0-win64-setup.exe`（文件名要和 `MIRROR_UPDATE_ASSET` 一致）；
-3. 服务器 `git pull && uv sync --frozen && sudo systemctl restart offcraft-mirror`；
-4. 按 5.2 的 curl 自检，再打开 `/page/` 与 `/page/status` 各点一遍；
-5. `.env` 写入 `MIRROR_UPDATE_MIN_VERSION=0.7.0` 并 `sudo systemctl restart offcraft-mirror`。
+2. GitHub 建 tag（如 `v0.9.1`），上传资产（`CrMCDownload-0.9.1-win64-setup.exe` 等）；
+3. **服务端不需要改配置也不需要重启**：自动检测会在 TTL（默认 10 分钟）内跟上，
+   想立刻生效就删掉 `<MIRROR_DATA_DIR>/releases.json` 再打一次 `/api/update`；
+4. 按 5.2 的 curl 自检，确认 `/api/update` 的 `latest_version` 已经是新版本，
+   镜像 `Range` 请求返回 206，再打开 `/page/` 与 `/page/status` 各点一遍；
+5. 只有「想强制旧客户端升级」时才需要动配置：`.env` 写 `MIRROR_UPDATE_MIN_VERSION=auto`
+   （或具体版本号）后 `sudo systemctl restart offcraft-mirror`。
 
 
 ## 备选：无子域名（独立端口）
@@ -171,6 +193,8 @@ caddy run --config caddy/Caddyfile --adapter caddyfile
 | 查看日志 | `journalctl -u offcraft-mirror -f` |
 | 缓存命中 | `curl -s http://127.0.0.1:8081/metrics` |
 | 清理缓存 | `sudo rm -rf /var/lib/offcraft-mirror/*`（服务无需重启） |
+| 强刷版本快照 | `rm -f ../db/CrMcDownload/releases.json && curl -s https://mc.yjlt.top/api/update` |
+| 看版本检测状态 | `curl -s 'https://mc.yjlt.top/api/releases?limit=1' \| python -m json.tool`（关注 `check.source` / `check.stale` / `check.error`） |
 | 升级 | `git pull && uv sync --frozen && sudo systemctl restart offcraft-mirror` |
 
 ## 安全

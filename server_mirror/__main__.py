@@ -66,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
         settings.proxy = args.proxy
 
     settings.prepare()  # 持久数据目录（默认 ../db/CrMcDownload）不存在就创建
+    # 版本自动检测：最新版本来自 GitHub Releases，服务端缓存（MIRROR_UPDATE_AUTO=off 可关）
+    settings.releases_provider = settings.build_releases()
+    if settings.update_auto:
+        settings.releases_provider.start()
     db = Database(settings.db_path)
     skins = SkinStore(settings.skins_dir)
     page = StaticHandler(settings.page_dir)
@@ -106,7 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         f"mirror listening on http://{settings.host}:{settings.port} "
         f"cache={settings.cache_dir} token={'on' if settings.token else 'off'} "
         f"db={settings.db_path} probe={'on' if probe else 'off'} "
-        f"p2p={'on' if p2p_router else 'off'}"
+        f"versions={'github' if settings.update_auto else 'static'}"
+        f" p2p={'on' if p2p_router else 'off'}"
         + (f" p2p-udp={settings.host}:{edge.port}" if edge is not None else ""),
         flush=True,
     )

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, latestVersion, type UpdatePayload } from "@/api/client";
+import { api, latestVersion, humanBytes, type UpdatePayload } from "@/api/client";
 
 const info = ref<UpdatePayload | null>(null);
 const online = ref(true);
@@ -13,20 +13,41 @@ onMounted(async () => {
   }
 });
 
+// 版本、安装包名与大小都来自服务端自动检测到的 GitHub Release，
+// 页面上不再写死任何版本号或文件名。
 const latest = computed(() => info.value?.latest_version || latestVersion.value);
 const min = computed(() => info.value?.min_version || "未设置");
-const repo = "https://github.com/leaf-CatLin/CrMcDownload";
-const releaseUrl = computed(() => info.value?.release_url || `${repo}/releases/tag/v${latest.value}`);
+const repoSlug = computed(() => "leaf-CatLin/CrMcDownload");
+const releaseUrl = computed(
+  () => info.value?.release_url || `https://github.com/${repoSlug.value}/releases/tag/v${latest.value}`,
+);
+const assetName = computed(
+  () => info.value?.asset?.name || `CrMCDownload-${latest.value}-win64-setup.exe`,
+);
+const assetSize = computed(() => humanBytes(info.value?.asset?.size));
 const directUrl = computed(
   () =>
     info.value?.download_url ||
-    `${repo}/releases/download/v${latest.value}/CrMCDownload-${latest.value}-win64-setup.exe`,
+    `https://github.com/${repoSlug.value}/releases/download/v${latest.value}/${assetName.value}`,
 );
 const mirrorUrl = computed(
   () =>
     info.value?.mirror_download_url ||
-    `/github/leaf-CatLin/CrMcDownload/releases/download/v${latest.value}/CrMCDownload-${latest.value}-win64-setup.exe`,
+    `/github/${repoSlug.value}/releases/download/v${latest.value}/${assetName.value}`,
 );
+
+/** 全部资产（安装版 + 免安装版），供想省流量的人直接挑。 */
+const otherAssets = computed(() =>
+  (info.value?.assets || []).filter((item) => item.name && item.name !== assetName.value),
+);
+
+function mirrorOf(url: string | null | undefined): string {
+  const text = String(url || "");
+  const marker = "github.com/";
+  const index = text.indexOf(marker);
+  if (index < 0) return "";
+  return `/github/${text.slice(index + marker.length)}`;
+}
 </script>
 
 <template>
@@ -59,6 +80,18 @@ const mirrorUrl = computed(
             <a class="btn" :href="mirrorUrl">镜像下载（推荐国内）</a>
             <a class="btn ghost" :href="releaseUrl" target="_blank" rel="noreferrer">查看发布页</a>
           </div>
+          <div v-if="otherAssets.length" class="release-assets">
+            <span class="muted">其它产物：</span>
+            <a
+              v-for="asset in otherAssets"
+              :key="asset.name"
+              :href="asset.url || mirrorOf(asset.url)"
+              target="_blank"
+              rel="noreferrer"
+            >
+              {{ asset.name }}<template v-if="asset.size"> · {{ humanBytes(asset.size) }}</template>
+            </a>
+          </div>
           <div class="release-note">
             小提示：客户端的「设置 → 更新」会自动先测 GitHub 延迟，过高时清理 DNS 缓存重测，
             仍然偏高才切换到镜像，整个下载过程支持断点续传喵。
@@ -78,7 +111,7 @@ const mirrorUrl = computed(
         <div class="steps">
           <div class="step">
             <h3>下载安装包</h3>
-            <p>点击上面的按钮，拿到 <code>CrMCDownload-{{ latest }}-win64-setup.exe</code>。</p>
+            <p>点击上面的按钮，拿到 <code>{{ assetName }}</code>（约 {{ assetSize }}）。</p>
           </div>
           <div class="step">
             <h3>安装并登录</h3>

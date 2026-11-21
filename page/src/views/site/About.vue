@@ -29,6 +29,10 @@ import { latestVersion } from "@/api/client";
               你可以在 GitHub 上看到每一次提交。
             </p>
             <p>
+              最新版本由服务端直接读 GitHub Releases 自动检测并缓存（本页的版本号就来自那里），
+              发一版新客户端，下载页、更新日志与版本门槛会自动跟上，不需要人工改配置。
+            </p>
+            <p>
               0.7.0 开始，服务端可以配置「最低支持版本」：旧客户端请求资源时会收到 426，
               并附带最新版本与发布页地址，避免版本过旧导致资源不兼容喵。
             </p>
@@ -74,7 +78,8 @@ import { latestVersion } from "@/api/client";
             <tr><td><code>/fabric/</code> · <code>/forgemaven/</code> · <code>/neoforgemaven/</code></td><td>加载器元数据与 jar</td></tr>
             <tr><td><code>/modrinth/</code> · <code>/modcdn/</code></td><td>模组搜索、项目、版本与文件</td></tr>
             <tr><td><code>/github/</code></td><td>GitHub Releases 资产代理（支持 Range 断点续传）</td></tr>
-            <tr><td><code>/api/update</code></td><td>最新 / 最低版本、强制更新标记、下载地址</td></tr>
+            <tr><td><code>/api/update</code></td><td>最新 / 最低版本、强制更新标记、下载地址（自动检测）</td></tr>
+            <tr><td><code>/api/releases</code></td><td>更新历史（GitHub Releases 自动检测 + 缓存）</td></tr>
             <tr><td><code>/update</code></td><td>301 重定向到 GitHub Releases 页面</td></tr>
             <tr><td><code>/status</code></td><td>运维看板：缓存、下载热度、联机、皮肤</td></tr>
           </tbody>

@@ -34,8 +34,60 @@ export interface UpdatePayload {
   release_url?: string;
   download_url?: string;
   mirror_download_url?: string;
-  asset?: { name?: string; size?: number | null };
+  asset?: { name?: string; size?: number | null; url?: string; mirror_url?: string };
   error?: string;
+  // 自动检测相关：最新版本来自 GitHub Releases，服务端缓存
+  tag?: string;
+  published_at?: string;
+  channel?: string;
+  notes?: string;
+  assets?: ReleaseAsset[];
+  version_source?: string;
+  version_checked_at?: number;
+  version_stale?: boolean;
+}
+
+export interface ReleaseAsset {
+  name?: string;
+  size?: number | null;
+  url?: string | null;
+  downloads?: number | null;
+}
+
+export interface ReleaseEntry {
+  tag: string;
+  version: string;
+  name?: string;
+  url?: string;
+  published_at?: string;
+  channel?: string;
+  prerelease?: boolean;
+  body?: string;
+  assets?: ReleaseAsset[];
+  download_base?: string;
+}
+
+export interface ReleaseCheck {
+  source?: string;
+  fetched_at?: number;
+  age?: number | null;
+  ttl?: number;
+  stale?: boolean;
+  error?: string;
+}
+
+export interface ReleasesPayload {
+  ok?: boolean;
+  repo?: string;
+  latest_version?: string;
+  min_version?: string;
+  release_url?: string;
+  download_url?: string;
+  mirror_download_url?: string;
+  asset?: { name?: string; size?: number | null };
+  assets?: ReleaseAsset[];
+  releases?: ReleaseEntry[];
+  check?: ReleaseCheck | null;
 }
 
 
@@ -116,6 +168,8 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export const api = {
   update: (signal?: AbortSignal) => getJSON<UpdatePayload>("/api/update", signal),
+  // 更新历史：GitHub Releases 自动检测的结果（服务端缓存），官网更新日志读它
+  releases: (signal?: AbortSignal) => getJSON<ReleasesPayload>("/api/releases?limit=8", signal),
   health: (signal?: AbortSignal) => getJSON<Health>("/health", signal),
   overview: (signal?: AbortSignal) => getJSON<Overview>("/api/stats/overview", signal),
   cache: (signal?: AbortSignal) => getJSON<CacheStats>("/api/stats/cache", signal),

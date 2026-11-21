@@ -644,6 +644,22 @@ svg {
   font-size: 13px;
 }
 
+/* 主安装包之外的产物（免安装 zip 等），来自 GitHub Release 资产列表 */
+.release-assets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+.release-assets a {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--line-strong);
+}
+
 .steps {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -739,6 +755,19 @@ svg {
 .log-date {
   color: var(--muted);
   font-size: 13px;
+}
+
+/* 每条版本右侧的「发布页」链接（更新日志来自 GitHub Releases 自动检测） */
+.log-link {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px dashed currentColor;
+}
+
+.log-link:hover {
+  color: var(--ink);
 }
 
 .log-item ul {
